@@ -1,0 +1,37 @@
+# 构建目录
+/build/
+/bin/
+/obj/
+
+# 下载目录
+/utils/downloads/
+/vendor/
+/third_party/
+
+# 编译产物
+*.o
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+
+# IDE 文件
+/.idea/
+/.vscode/
+*.swp
+*.swo
+
+# OS 文件
+.DS_Store
+Thumbs.db
+
+# 日志和临时文件
+*.log
+/tmp/
+temp/
+
+# 环境配置
+.env
+.env.local
