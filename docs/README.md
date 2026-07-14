@@ -36,9 +36,8 @@ cd /data/sunpf/ffmpeg-builds
 | 参数（ADDINS） | 目录 | 缺失时下载 |
 |----------------|------|------------|
 | `8.1.2`（默认） | `ffmpeg/ffmpeg-8.1.2` | `git clone --branch n8.1.2` |
-| `8.1.3` | `ffmpeg/ffmpeg-8.1.3` | `git clone --branch n8.1.3` |
 
-是否“已存在”：只看对应目录下是否有 `configure`；**不会**用 8.1.2 顶替 8.1.3。
+是否“已存在”：只看对应目录下是否有 `configure`；**不会**用 8.1.2。
 
 ## 常用环境变量
 
