@@ -1,0 +1,35 @@
+#!/bin/bash
+
+SCRIPT_REPO="https://github.com/mm2/Little-CMS.git"
+SCRIPT_COMMIT="5cc0eec7ae8350dd0f6c4c07b077f78f18dfe970"
+
+ffbuild_enabled() {
+    return 0
+}
+
+ffbuild_build() {
+    mkdir build && cd build
+
+    local myconf=(
+        --prefix="$FFBUILD_PREFIX"
+        -Ddefault_library=static
+        -Dutils=false
+        -Dfastfloat=true
+        -Dthreaded=true
+    )
+
+    if [[ $TARGET == win* || $TARGET == linux* ]]; then
+        myconf+=(
+            --cross-file="$CROSS_MESON"
+        )
+    else
+        echo "Unknown target"
+        return -1
+    fi
+
+    export CFLAGS="$CFLAGS -fpermissive"
+
+    meson setup "${myconf[@]}" ..
+    ninja -j$(nproc)
+    DESTDIR="$FFBUILD_DESTDIR" ninja install
+}

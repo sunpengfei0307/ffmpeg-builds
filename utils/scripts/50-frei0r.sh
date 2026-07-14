@@ -1,0 +1,30 @@
+#!/bin/bash
+
+SCRIPT_REPO="https://github.com/dyne/frei0r.git"
+SCRIPT_COMMIT="253addfd4bea3c90b0bf765589ca28ea18f3ddc0"
+
+ffbuild_enabled() {
+    [[ $VARIANT == lgpl* ]] && return -1
+    (( $(ffbuild_ffver) >= 500 )) || return -1
+    return 0
+}
+
+ffbuild_build() {
+    echo > test/CMakeLists.txt
+
+    mkdir build && cd build
+
+    cmake -G Ninja -DCMAKE_TOOLCHAIN_FILE="$FFBUILD_CMAKE_TOOLCHAIN" -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$FFBUILD_PREFIX" \
+        -DWITHOUT_OPENCV=ON -DWITHOUT_FACERECOGNITION=ON -DWITHOUT_CAIRO=ON -DWITHOUT_GAVL=ON ..
+    ninja -j$(nproc)
+    DESTDIR="$FFBUILD_DESTDIR" ninja install
+}
+
+ffbuild_configure() {
+    echo --enable-frei0r
+}
+
+ffbuild_unconfigure() {
+    (( $(ffbuild_ffver) >= 404 )) || return 0
+    echo --disable-frei0r
+}

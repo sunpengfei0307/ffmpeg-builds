@@ -1,0 +1,61 @@
+#!/bin/bash
+
+SCRIPT_REPO="https://github.com/Netflix/vmaf.git"
+SCRIPT_COMMIT="0f9912e4714cb0918f474361fc2c7ef2f0a791b5"
+
+ffbuild_enabled() {
+    return 0
+}
+
+ffbuild_build() {
+    # Kill build of unused and broken tools
+    echo > libvmaf/tools/meson.build
+
+    mkdir build && cd build
+
+    local myconf=(
+        --prefix="$FFBUILD_PREFIX"
+        --buildtype=release
+        --default-library=static
+        -Dbuilt_in_models=true
+        -Denable_tests=false
+        -Denable_docs=false
+        -Denable_float=true
+    )
+
+    if [[ $TARGET == *32 ]]; then
+        myconf+=(
+            -Denable_avx512=false
+            -Denable_asm=false
+        )
+    else
+        myconf+=(
+            -Denable_avx512=true
+            -Denable_asm=true
+        )
+    fi
+
+    if [[ $TARGET == win* || $TARGET == linux* ]]; then
+        myconf+=(
+            --cross-file="$CROSS_MESON"
+        )
+    else
+        echo "Unknown target"
+        return -1
+    fi
+
+    meson "${myconf[@]}" ../libvmaf || cat meson-logs/meson-log.txt
+    ninja -j"$(nproc)"
+    DESTDIR="$FFBUILD_DESTDIR" ninja install
+
+    sed -i 's/Libs.private:/Libs.private: -lstdc++/; t; $ a Libs.private: -lstdc++' "$FFBUILD_DESTPREFIX"/lib/pkgconfig/libvmaf.pc
+}
+
+ffbuild_configure() {
+    (( $(ffbuild_ffver) >= 501 )) || return 0
+    echo --enable-libvmaf
+}
+
+ffbuild_unconfigure() {
+    echo --disable-libvmaf
+}
