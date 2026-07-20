@@ -28,7 +28,7 @@ cd /data/sunpf/ffmpeg-builds
 ./build.sh linux64 nonfree 8.1.2
 # 手动构建：PATH="/data/sunpf/ffmpeg-builds/build/tools/bin:$PATH" make -j"$(nproc)"
 # 另一补丁版本会用独立目录并重新下载：
-# ./build.sh linux64 nonfree 8.1.3   → ffmpeg/ffmpeg-8.1.3 + tag n8.1.3
+# ./build.sh linux64 nonfree 8.1.2   → ffmpeg/ffmpeg-8.1.2 + tag n8.1.2
 ```
 
 ## 版本与源码目录
@@ -36,9 +36,8 @@ cd /data/sunpf/ffmpeg-builds
 | 参数（ADDINS） | 目录 | 缺失时下载 |
 |----------------|------|------------|
 | `8.1.2`（默认） | `ffmpeg/ffmpeg-8.1.2` | `git clone --branch n8.1.2` |
-| `8.1.3` | `ffmpeg/ffmpeg-8.1.3` | `git clone --branch n8.1.3` |
 
-是否“已存在”：只看对应目录下是否有 `configure`；**不会**用 8.1.2 顶替 8.1.3。
+是否“已存在”：只看对应目录下是否有 `configure`；**不会**用 8.1.2。
 
 ## 常用环境变量
 
