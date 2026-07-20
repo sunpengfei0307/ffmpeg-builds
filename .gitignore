@@ -30,24 +30,21 @@
 *.ptx.c
 *.ptx.gz
 *_g
+*.Identifier
 \#*
 .\#*
 /.config
 /.version
-/ffmpeg
-/ffplay
-/ffprobe
+# 注意：不要写 /ffmpeg —— 本仓源码在 ffmpeg/ 目录下，会把整棵树忽略掉。
+# FFmpeg 构建产物在 /build/，根目录一般不会落 ffmpeg/ffplay/ffprobe 二进制。
 /config.asm
 /config.h
 /config_components.asm
 /config_components.h
 /coverage.info
 /lcov/
-/src
 /mapfile
 /tools/python/__pycache__/
-/libavcodec/vulkan/*.c
-/libavfilter/vulkan/*.c
 /.*/
 !/.forgejo/
 

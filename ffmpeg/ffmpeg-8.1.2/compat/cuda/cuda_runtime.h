@@ -35,6 +35,7 @@
 #define abs(x) ((x) < 0 ? -(x) : (x))
 
 #define atomicAdd(a, b) (__atomic_fetch_add(a, b, __ATOMIC_SEQ_CST))
+#define atomicSub(a, b) (__atomic_fetch_sub(a, b, __ATOMIC_SEQ_CST))
 
 // Basic typedefs
 typedef __device_builtin__ unsigned long long cudaTextureObject_t;
@@ -58,6 +59,16 @@ typedef struct __device_builtin__ __align__(8) int2
 {
     int x, y;
 } int2;
+
+typedef struct __device_builtin__ __align__(4) int3
+{
+    int x, y, z;
+} int3;
+
+typedef struct __device_builtin__ __align__(16) float3
+{
+    float x, y, z;
+} float3;
 
 typedef struct __device_builtin__ uint3
 {
@@ -114,6 +125,8 @@ GET(getThreadIdx, tid)
 #define make_uchar2(a, b) ((uchar2){.x = a, .y = b})
 #define make_ushort2(a, b) ((ushort2){.x = a, .y = b})
 #define make_float2(a, b) ((float2){.x = a, .y = b})
+#define make_int3(a, b, c) ((int3){.x = a, .y = b, .z = c})
+#define make_float3(a, b, c) ((float3){.x = a, .y = b, .z = c})
 #define make_int4(a, b, c, d) ((int4){.x = a, .y = b, .z = c, .w = d})
 #define make_uchar4(a, b, c, d) ((uchar4){.x = a, .y = b, .z = c, .w = d})
 #define make_ushort4(a, b, c, d) ((ushort4){.x = a, .y = b, .z = c, .w = d})
@@ -188,6 +201,22 @@ static inline __device__ float __sinf(float a) { return __nvvm_sin_approx_f(a); 
 static inline __device__ float __cosf(float a) { return __nvvm_cos_approx_f(a); }
 static inline __device__ float __expf(float a) { return __nvvm_ex2_approx_f(a * (float)__builtin_log2(__builtin_exp(1))); }
 static inline __device__ float __powf(float a, float b) { return __nvvm_ex2_approx_f(__nvvm_lg2_approx_f(a) * b); }
+
+/* Standard math names used by filter kernels (clang -nocudainc path). */
+static inline __device__ float fmaxf(float a, float b) { return a > b ? a : b; }
+static inline __device__ float fminf(float a, float b) { return a < b ? a : b; }
+static inline __device__ float expf(float a) { return __expf(a); }
+static inline __device__ float powf(float a, float b) { return __powf(a, b); }
+static inline __device__ float logf(float a)
+{
+    /* log(a) = log2(a) * ln(2) */
+    return __nvvm_lg2_approx_f(a) * 0.69314718056f;
+}
+static inline __device__ float log10f(float a)
+{
+    /* log10(a) = log2(a) / log2(10) */
+    return __nvvm_lg2_approx_f(a) * 0.30102999566f;
+}
 
 // Misc helper functions
 extern "C" __device__ int printf(const char*, ...);

@@ -20,7 +20,9 @@
 #include <stdint.h>
 
 #include "ffmpeg.h"
+#include "ffmpeg_monitor.h"
 #include "ffmpeg_sched.h"
+#include "ffmpeg_sei.h"
 #include "ffmpeg_utils.h"
 
 #include "libavutil/avassert.h"
@@ -472,6 +474,10 @@ static int input_packet_process(Demuxer *d, AVPacket *pkt, unsigned *send_flags)
     if (!fd)
         return AVERROR(ENOMEM);
 
+    /* sample before ts_fixup — same as 6.1.1 demux.c near_pkt_* */
+    ffmpeg_monitor_push_pkt_ts(ist->near_pkt_pts, ist->near_pkt_dts,
+                               ist->near_Idr_pts, ist->near_Idr_dts, pkt);
+
     ret = ts_fixup(d, pkt, fd);
     if (ret < 0)
         return ret;
@@ -489,6 +495,10 @@ static int input_packet_process(Demuxer *d, AVPacket *pkt, unsigned *send_flags)
     ds->data_size += pkt->size;
     ds->nb_packets++;
 
+    ist->demux_data_size  = ds->data_size;
+    ist->demux_nb_packets = ds->nb_packets;
+    ist->decoding_needed  = ds->decoding_needed;
+
     fd->wallclock[LATENCY_PROBE_DEMUX] = av_gettime_relative();
 
     if (debug_ts) {
@@ -499,6 +509,12 @@ static int input_packet_process(Demuxer *d, AVPacket *pkt, unsigned *send_flags)
                av_ts2str(pkt->dts), av_ts2timestr(pkt->dts, &pkt->time_base),
                av_ts2str(pkt->duration), av_ts2timestr(pkt->duration, &pkt->time_base),
                av_ts2str(f->ts_offset),  av_ts2timestr(f->ts_offset, &AV_TIME_BASE_Q));
+    }
+
+    if (copy_sei == 1 && ist->par->codec_type == AVMEDIA_TYPE_VIDEO && pkt->data) {
+        int64_t sei_index = ist->decoder ? (int64_t)ist->decoder->frames_decoded : 0;
+        parse_sei_nalus(ist->par->codec_id, pkt->data, pkt->size,
+                        pkt->pts, pkt->dts, sei_index);
     }
 
     return 0;

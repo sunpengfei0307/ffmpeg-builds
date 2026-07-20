@@ -2326,3 +2326,43 @@ _build_ffmpeg_into_usr() {
     return 1
   fi
 }
+
+# Optional: build detect_cuda TensorRT plugin → $FFBUILD_PREFIX/lib
+# SKIP_DETECT_CUDA_TRT=1           skip
+# REQUIRE_DETECT_CUDA_TRT=1        treat failure as fatal (default: warn only)
+stage_build_detect_cuda_trt() {
+  local script="${ROOT_DIR}/utils/build-detect-cuda-trt.sh"
+  local out_so="${FFBUILD_PREFIX:-${USR_DIR}}/lib/libavfilter_detect_cuda_trt.so"
+
+  if [[ -n "${SKIP_DETECT_CUDA_TRT:-}" ]]; then
+    _skip "detect_cuda TRT 插件（SKIP_DETECT_CUDA_TRT=1）"
+    return 0
+  fi
+
+  if [[ ! -f "$script" ]]; then
+    _fail "缺少 $script"
+    [[ -n "${REQUIRE_DETECT_CUDA_TRT:-}" ]] && return 1
+    return 0
+  fi
+
+  _banner "编译 detect_cuda TensorRT 插件 → ${FFBUILD_PREFIX:-${USR_DIR}}/lib"
+  export FFMPEG_SRC="${FFMPEG_SRC:-${FFMPEG_DIR}}"
+  export FFBUILD_PREFIX="${FFBUILD_PREFIX:-${USR_DIR}}"
+  export OUT_DIR="${FFBUILD_PREFIX}/lib"
+
+  if _run "detect-cuda-trt" bash "$script"; then
+    if [[ -f "$out_so" ]]; then
+      _ok "detect_cuda TRT → $out_so"
+      return 0
+    fi
+    _fail "脚本成功但未找到 $out_so"
+  else
+    _fail "detect_cuda TRT 插件编译失败（可设 TRT_ROOT / SKIP_DETECT_CUDA_TRT=1）"
+  fi
+
+  if [[ -n "${REQUIRE_DETECT_CUDA_TRT:-}" ]]; then
+    return 1
+  fi
+  _info "已忽略 TRT 插件失败（默认不阻断整体构建；需要严格模式请设 REQUIRE_DETECT_CUDA_TRT=1）"
+  return 0
+}

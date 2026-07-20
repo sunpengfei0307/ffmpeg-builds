@@ -209,6 +209,27 @@ int enc_open(void *opaque, const AVFrame *frame)
                               fd->side_data, fd->nb_side_data, AV_FRAME_SIDE_DATA_FLAG_UNIQUE);
         if (ret < 0)
             return ret;
+
+        /*
+         * Filter graphs (e.g. hlg2pq_cuda) may attach GLOBAL HDR side data on
+         * frames without propagating it to the buffersink link side_data used
+         * for fd->side_data. Copy GLOBAL types from the first frame so encoders
+         * (nvenc mastering/CLL) and muxers (coded_side_data) see them.
+         */
+        for (int i = 0; i < frame->nb_side_data; i++) {
+            const AVSideDataDescriptor *desc =
+                av_frame_side_data_desc(frame->side_data[i]->type);
+
+            if (!desc || !(desc->props & AV_SIDE_DATA_PROP_GLOBAL))
+                continue;
+
+            ret = av_frame_side_data_clone(&enc_ctx->decoded_side_data,
+                                           &enc_ctx->nb_decoded_side_data,
+                                           frame->side_data[i],
+                                           AV_FRAME_SIDE_DATA_FLAG_UNIQUE);
+            if (ret < 0)
+                return ret;
+        }
     }
 
     if (ist)

@@ -17,10 +17,13 @@ OBJS-ffmpeg +=                  \
     fftools/ffmpeg_enc.o        \
     fftools/ffmpeg_filter.o     \
     fftools/ffmpeg_hw.o         \
+    fftools/ffmpeg_monitor.o    \
     fftools/ffmpeg_mux.o        \
     fftools/ffmpeg_mux_init.o   \
     fftools/ffmpeg_opt.o        \
     fftools/ffmpeg_sched.o      \
+    fftools/ffmpeg_sei.o        \
+    fftools/yyjson.o            \
     fftools/graph/graphprint.o        \
     fftools/sync_queue.o        \
     fftools/thread_queue.o      \
@@ -53,6 +56,11 @@ OBJS-ffprobe +=                       \
 
 OBJS-ffmpeg += $(COMPAT_OBJS:%=compat/%)
 OBJS-ffplay += fftools/ffplay_renderer.o
+
+# IZeromq in fftools/spfutils.h (ensure link even if no zmq filter selected)
+ifdef CONFIG_LIBZMQ
+EXTRALIBS-ffmpeg += -lzmq
+endif
 
 define DOFFTOOL
 OBJS-$(1) += fftools/cmdutils.o fftools/opt_common.o fftools/$(1).o $(OBJS-$(1)-yes)

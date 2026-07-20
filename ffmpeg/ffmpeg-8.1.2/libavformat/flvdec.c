@@ -229,6 +229,21 @@ static AVStream *create_stream(AVFormatContext *s, int codec_type, int track_idx
     return st;
 }
 
+static int flv_is_enhanced_audio_fourcc(uint32_t fourcc)
+{
+    switch (fourcc) {
+    case MKBETAG('m', 'p', '4', 'a'):
+    case MKBETAG('O', 'p', 'u', 's'):
+    case MKBETAG('.', 'm', 'p', '3'):
+    case MKBETAG('f', 'L', 'a', 'C'):
+    case MKBETAG('a', 'c', '-', '3'):
+    case MKBETAG('e', 'c', '-', '3'):
+        return 1;
+    default:
+        return 0;
+    }
+}
+
 static int flv_same_audio_codec(AVCodecParameters *apar, int flags, uint32_t codec_fourcc)
 {
     int bits_per_coded_sample = (flags & FLV_AUDIO_SAMPLESIZE_MASK) ? 16 : 8;
@@ -296,6 +311,8 @@ static int flv_same_audio_codec(AVCodecParameters *apar, int flags, uint32_t cod
     case FLV_CODECID_PCM_ALAW:
         return apar->sample_rate == 8000 &&
                apar->codec_id    == AV_CODEC_ID_PCM_ALAW;
+    case FLV_CODECID_X_OPUS:
+        return apar->codec_id == AV_CODEC_ID_OPUS;
     default:
         return apar->codec_tag == (flv_codecid >> FLV_AUDIO_CODECID_OFFSET);
     }
@@ -358,6 +375,11 @@ static int flv_set_audio_codec(AVFormatContext *s, AVStream *astream,
         apar->sample_rate = 8000;
         apar->codec_id    = AV_CODEC_ID_PCM_ALAW;
         break;
+    case FLV_CODECID_X_OPUS:
+        /* legacy domestic Opus (SoundFormat=9, AAC-style body) */
+        apar->codec_id    = AV_CODEC_ID_OPUS;
+        apar->sample_rate = 48000;
+        break;
     case MKBETAG('m', 'p', '4', 'a'):
         apar->codec_id = AV_CODEC_ID_AAC;
         break;
@@ -401,8 +423,12 @@ static int flv_same_video_codec(AVCodecParameters *vpar, uint32_t flv_codecid)
     case FLV_CODECID_X_HEVC:
     case MKBETAG('h', 'v', 'c', '1'):
         return vpar->codec_id == AV_CODEC_ID_HEVC;
+    case FLV_CODECID_X_AV1:
     case MKBETAG('a', 'v', '0', '1'):
         return vpar->codec_id == AV_CODEC_ID_AV1;
+    case FLV_CODECID_X_VP8:
+        return vpar->codec_id == AV_CODEC_ID_VP8;
+    case FLV_CODECID_X_VP9:
     case MKBETAG('v', 'p', '0', '9'):
         return vpar->codec_id == AV_CODEC_ID_VP9;
     case FLV_CODECID_H263:
@@ -441,10 +467,16 @@ static int flv_set_video_codec(AVFormatContext *s, AVStream *vstream,
         par->codec_id = AV_CODEC_ID_HEVC;
         vstreami->need_parsing = AVSTREAM_PARSE_HEADERS;
         break;
+    case FLV_CODECID_X_AV1:
     case MKBETAG('a', 'v', '0', '1'):
         par->codec_id = AV_CODEC_ID_AV1;
         vstreami->need_parsing = AVSTREAM_PARSE_HEADERS;
         break;
+    case FLV_CODECID_X_VP8:
+        par->codec_id = AV_CODEC_ID_VP8;
+        vstreami->need_parsing = AVSTREAM_PARSE_HEADERS;
+        break;
+    case FLV_CODECID_X_VP9:
     case MKBETAG('v', 'p', '0', '9'):
         par->codec_id = AV_CODEC_ID_VP9;
         vstreami->need_parsing = AVSTREAM_PARSE_HEADERS;
@@ -1435,31 +1467,56 @@ retry:
         size--;
 
         if ((flags & FLV_AUDIO_CODECID_MASK) == FLV_CODECID_EX_HEADER) {
-            enhanced_flv = 1;
-            pkt_type = flags & ~FLV_AUDIO_CODECID_MASK;
+            int low = flags & ~FLV_AUDIO_CODECID_MASK;
+            int use_enhanced = 0;
 
-            while (pkt_type == PacketTypeModEx) {
-                ret = flv_parse_mod_ex_data(s, &pkt_type, &size, &dts);
-                if (ret < 0)
-                    goto leave;
+            /*
+             * SoundFormat=9 is dual-use:
+             * - Enhanced RTMP: low nibble = AudioPacketType, then FourCC
+             * - Legacy domestic Opus: low nibble = rate/size/channels,
+             *   then AAC-style packet type byte (0=seq / 1=raw)
+             */
+            if (low == PacketTypeModEx || low == AudioPacketTypeMultitrack) {
+                use_enhanced = 1;
+            } else if (low == AudioPacketTypeSequenceStart ||
+                       low == AudioPacketTypeCodedFrames ||
+                       low == AudioPacketTypeMultichannelConfig) {
+                if (size >= 4) {
+                    int64_t peek_pos = avio_tell(s->pb);
+                    uint32_t fcc = avio_rb32(s->pb);
+                    avio_seek(s->pb, peek_pos, SEEK_SET);
+                    use_enhanced = flv_is_enhanced_audio_fourcc(fcc);
+                }
             }
 
-            if (pkt_type == AudioPacketTypeMultitrack) {
-                uint8_t types = avio_r8(s->pb);
-                multitrack_type = types & 0xF0;
-                pkt_type = types & 0xF;
+            if (use_enhanced) {
+                enhanced_flv = 1;
+                pkt_type = low;
 
-                multitrack = 1;
-                size--;
+                while (pkt_type == PacketTypeModEx) {
+                    ret = flv_parse_mod_ex_data(s, &pkt_type, &size, &dts);
+                    if (ret < 0)
+                        goto leave;
+                }
+
+                if (pkt_type == AudioPacketTypeMultitrack) {
+                    uint8_t types = avio_r8(s->pb);
+                    multitrack_type = types & 0xF0;
+                    pkt_type = types & 0xF;
+
+                    multitrack = 1;
+                    size--;
+                }
+
+                codec_id = avio_rb32(s->pb);
+                size -= 4;
+
+                if (multitrack) {
+                    track_idx = avio_r8(s->pb);
+                    size--;
+                }
             }
-
-            codec_id = avio_rb32(s->pb);
-            size -= 4;
-
-            if (multitrack) {
-                track_idx = avio_r8(s->pb);
-                size--;
-            }
+            /* else: legacy Opus; flv_set_audio_codec maps EX_HEADER -> OPUS */
         }
     } else if (type == FLV_TAG_TYPE_VIDEO) {
         stream_type = FLV_STREAM_TYPE_VIDEO;
@@ -1762,6 +1819,7 @@ retry_duration:
             st->codecpar->codec_id == AV_CODEC_ID_HEVC ||
             st->codecpar->codec_id == AV_CODEC_ID_VVC ||
             st->codecpar->codec_id == AV_CODEC_ID_AV1 ||
+            st->codecpar->codec_id == AV_CODEC_ID_VP8 ||
             st->codecpar->codec_id == AV_CODEC_ID_VP9) {
             int type = 0;
             if (enhanced_flv) {
@@ -1787,7 +1845,11 @@ retry_duration:
                 ((st->codecpar->codec_id == AV_CODEC_ID_H264 ||
                   st->codecpar->codec_id == AV_CODEC_ID_VVC ||
                   st->codecpar->codec_id == AV_CODEC_ID_HEVC) &&
-                 (!enhanced_flv || type == PacketTypeCodedFrames))) {
+                 (!enhanced_flv || type == PacketTypeCodedFrames)) ||
+                (!enhanced_flv &&
+                 (st->codecpar->codec_id == AV_CODEC_ID_AV1 ||
+                  st->codecpar->codec_id == AV_CODEC_ID_VP8 ||
+                  st->codecpar->codec_id == AV_CODEC_ID_VP9))) {
                 if (size < 3 || track_size < 3) {
                     ret = AVERROR_INVALIDDATA;
                     goto leave;
@@ -1812,7 +1874,8 @@ retry_duration:
                 st->codecpar->codec_id == AV_CODEC_ID_OPUS || st->codecpar->codec_id == AV_CODEC_ID_FLAC ||
                 st->codecpar->codec_id == AV_CODEC_ID_H264 || st->codecpar->codec_id == AV_CODEC_ID_HEVC ||
                 st->codecpar->codec_id == AV_CODEC_ID_VVC ||
-                st->codecpar->codec_id == AV_CODEC_ID_AV1 || st->codecpar->codec_id == AV_CODEC_ID_VP9)) {
+                st->codecpar->codec_id == AV_CODEC_ID_AV1 || st->codecpar->codec_id == AV_CODEC_ID_VP8 ||
+                st->codecpar->codec_id == AV_CODEC_ID_VP9)) {
                 AVDictionaryEntry *t;
 
                 if (st->codecpar->extradata) {

@@ -36,6 +36,8 @@
 #include "libavutil/pixdesc.h"
 #include "libavutil/timecode_internal.h"
 #include "libavutil/mathematics.h"
+#include "libavutil/frame.h"
+#include "libavutil/intreadwrite.h"
 #include "libavutil/mastering_display_metadata.h"
 #include "libavutil/stereo3d.h"
 #include "libavutil/tdrdi.h"
@@ -1099,14 +1101,29 @@ static av_cold int nvenc_setup_rate_control(AVCodecContext *avctx)
     if (ctx->cqp < 0 && avctx->global_quality > 0)
         ctx->cqp = avctx->global_quality;
 
+    if (ctx->b_scale_ratio <= 0.1) {
+        av_log(avctx, AV_LOG_WARNING,
+               "b_scale_ratio=%g (<=0.1), reset to 1.4\n", ctx->b_scale_ratio);
+        ctx->b_scale_ratio = 1.4;
+    }
+
     if (avctx->bit_rate > 0) {
         ctx->encode_config.rcParams.averageBitRate = avctx->bit_rate;
+        ctx->encode_config.rcParams.maxBitRate =
+            (uint32_t)((ctx->b_scale_ratio - 0.1) * ctx->encode_config.rcParams.averageBitRate);
+        ctx->encode_config.rcParams.vbvBufferSize =
+            (uint32_t)(ctx->b_scale_ratio * ctx->encode_config.rcParams.averageBitRate);
     } else if (ctx->encode_config.rcParams.averageBitRate > 0) {
-        ctx->encode_config.rcParams.maxBitRate = ctx->encode_config.rcParams.averageBitRate;
+        ctx->encode_config.rcParams.maxBitRate =
+            (uint32_t)((ctx->b_scale_ratio - 0.1) * ctx->encode_config.rcParams.averageBitRate);
+        ctx->encode_config.rcParams.vbvBufferSize =
+            (uint32_t)(ctx->b_scale_ratio * ctx->encode_config.rcParams.averageBitRate);
     }
 
     if (avctx->rc_max_rate > 0)
         ctx->encode_config.rcParams.maxBitRate = avctx->rc_max_rate;
+    else if (ctx->encode_config.rcParams.maxBitRate > 0)
+        avctx->rc_max_rate = ctx->encode_config.rcParams.maxBitRate;
 
 #ifdef NVENC_HAVE_MULTIPASS
     ctx->encode_config.rcParams.multiPass = ctx->multipass;
@@ -1183,8 +1200,12 @@ static av_cold int nvenc_setup_rate_control(AVCodecContext *avctx)
 
     if (avctx->rc_buffer_size > 0) {
         ctx->encode_config.rcParams.vbvBufferSize = avctx->rc_buffer_size;
+    } else if (ctx->encode_config.rcParams.vbvBufferSize > 0) {
+        avctx->rc_buffer_size = ctx->encode_config.rcParams.vbvBufferSize;
     } else if (ctx->encode_config.rcParams.averageBitRate > 0) {
-        avctx->rc_buffer_size = ctx->encode_config.rcParams.vbvBufferSize = 2 * ctx->encode_config.rcParams.averageBitRate;
+        avctx->rc_buffer_size = ctx->encode_config.rcParams.vbvBufferSize =
+            (uint32_t)(ctx->b_scale_ratio > 0.1 ? ctx->b_scale_ratio : 2.0) *
+            ctx->encode_config.rcParams.averageBitRate;
     }
 
     if (ctx->aq) {
@@ -1250,6 +1271,20 @@ static av_cold int nvenc_setup_rate_control(AVCodecContext *avctx)
 
     if (ctx->zerolatency)
         ctx->encode_config.rcParams.zeroReorderDelay = 1;
+
+#ifdef NVENC_HAVE_QP_MAP_MODE
+    if (ctx->roi_qp_map) {
+        ctx->encode_config.rcParams.qpMapMode =
+            ctx->roi_qp_map_mode == NV_ENC_QP_MAP_EMPHASIS ?
+            NV_ENC_QP_MAP_EMPHASIS : NV_ENC_QP_MAP_DELTA;
+        av_log(avctx, AV_LOG_VERBOSE, "ROI QP map enabled, mode %d.\n",
+               ctx->encode_config.rcParams.qpMapMode);
+    }
+#else
+    if (ctx->roi_qp_map)
+        av_log(avctx, AV_LOG_WARNING,
+               "ROI QP map requested but NVENC headers lack qpMapMode support.\n");
+#endif
 
     if (ctx->quality) {
         //convert from float to fixed point 8.8
@@ -2224,6 +2259,9 @@ av_cold int ff_nvenc_encode_close(AVCodecContext *avctx)
 
     av_frame_free(&ctx->frame);
 
+    av_freep(&ctx->roi_qp_delta_map);
+    ctx->roi_qp_delta_map_size = 0;
+
     av_freep(&ctx->sei_data);
 
     if (ctx->nvencoder) {
@@ -2837,6 +2875,114 @@ static int output_ready(AVCodecContext *avctx, int flush)
     return (nb_ready > 0) && (nb_ready + nb_pending >= ctx->async_depth);
 }
 
+static uint16_t rescale_q_to_u16(AVRational q, int den)
+{
+    if (q.den <= 0 || q.num <= 0)
+        return 0;
+    return (uint16_t)av_clip_uintp2((int)av_rescale(q.num, den, q.den), 16);
+}
+
+static uint32_t rescale_q_to_u32(AVRational q, int den)
+{
+    int64_t v;
+    if (q.den <= 0 || q.num <= 0)
+        return 0;
+    v = av_rescale(q.num, den, q.den);
+    if (v < 0)
+        return 0;
+    if (v > UINT32_MAX)
+        return UINT32_MAX;
+    return (uint32_t)v;
+}
+
+/*
+ * Manual HDR10 SEI insertion from frame side data (ffmpeg 4.4 / iQIYI path).
+ * Used when NVENC native mastering output was not enabled at encoder init
+ * (e.g. metadata injected by filters after demux).
+ */
+static int nvenc_add_hdr10_sei(AVCodecContext *avctx, const AVFrame *frame,
+                               int *sei_count)
+{
+    NvencContext *ctx = avctx->priv_data;
+    AVFrameSideData *sd_mdm, *sd_cll;
+    void *tmp;
+
+    if (avctx->codec->id != AV_CODEC_ID_HEVC ||
+        frame->color_trc != AVCOL_TRC_SMPTE2084)
+        return 0;
+
+    sd_mdm = av_frame_get_side_data(frame, AV_FRAME_DATA_MASTERING_DISPLAY_METADATA);
+    sd_cll = av_frame_get_side_data(frame, AV_FRAME_DATA_CONTENT_LIGHT_LEVEL);
+
+    if (sd_mdm) {
+        const AVMasteringDisplayMetadata *mdm =
+            (const AVMasteringDisplayMetadata *)sd_mdm->data;
+        /* HEVC SEI stores display primaries as G, B, R */
+        static const int sei_order[3] = { 1, 2, 0 };
+        uint8_t *payload;
+        int i, off = 0;
+
+        if (mdm->has_primaries && mdm->has_luminance) {
+            tmp = av_fast_realloc(ctx->sei_data, &ctx->sei_data_size,
+                                  (*sei_count + 1) * sizeof(*ctx->sei_data));
+            if (!tmp)
+                return AVERROR(ENOMEM);
+
+            payload = av_mallocz(24);
+            if (!payload)
+                return AVERROR(ENOMEM);
+
+            ctx->sei_data = tmp;
+            for (i = 0; i < 3; i++) {
+                int c = sei_order[i];
+                AV_WB16(payload + off, rescale_q_to_u16(mdm->display_primaries[c][0], 50000));
+                off += 2;
+                AV_WB16(payload + off, rescale_q_to_u16(mdm->display_primaries[c][1], 50000));
+                off += 2;
+            }
+
+            AV_WB16(payload + off, rescale_q_to_u16(mdm->white_point[0], 50000));
+            off += 2;
+            AV_WB16(payload + off, rescale_q_to_u16(mdm->white_point[1], 50000));
+            off += 2;
+            AV_WB32(payload + off, rescale_q_to_u32(mdm->max_luminance, 10000));
+            off += 4;
+            AV_WB32(payload + off, rescale_q_to_u32(mdm->min_luminance, 10000));
+
+            ctx->sei_data[*sei_count].payloadSize = 24;
+            ctx->sei_data[*sei_count].payloadType = SEI_TYPE_MASTERING_DISPLAY_COLOUR_VOLUME;
+            ctx->sei_data[*sei_count].payload = payload;
+            (*sei_count)++;
+        }
+    }
+
+    if (sd_cll) {
+        const AVContentLightMetadata *clm =
+            (const AVContentLightMetadata *)sd_cll->data;
+        uint8_t *payload;
+
+        tmp = av_fast_realloc(ctx->sei_data, &ctx->sei_data_size,
+                              (*sei_count + 1) * sizeof(*ctx->sei_data));
+        if (!tmp)
+            return AVERROR(ENOMEM);
+
+        payload = av_mallocz(4);
+        if (!payload)
+            return AVERROR(ENOMEM);
+
+        ctx->sei_data = tmp;
+        AV_WB16(payload, FFMIN(clm->MaxCLL, 65535));
+        AV_WB16(payload + 2, FFMIN(clm->MaxFALL, 65535));
+
+        ctx->sei_data[*sei_count].payloadSize = 4;
+        ctx->sei_data[*sei_count].payloadType = SEI_TYPE_CONTENT_LIGHT_LEVEL_INFO;
+        ctx->sei_data[*sei_count].payload = payload;
+        (*sei_count)++;
+    }
+
+    return 0;
+}
+
 static int prepare_sei_data_array(AVCodecContext *avctx, const AVFrame *frame)
 {
     NvencContext *ctx = avctx->priv_data;
@@ -2907,6 +3053,19 @@ static int prepare_sei_data_array(AVCodecContext *avctx, const AVFrame *frame)
                 sei_count++;
             }
         }
+    }
+
+    /*
+     * When native NVENC mastering/CLL output is enabled, skip manual SEI to
+     * avoid duplicate messages. Otherwise insert from frame side data (4.4).
+     */
+#ifdef NVENC_HAVE_HEVC_AND_AV1_MASTERING_METADATA
+    if (!(ctx->mdm || ctx->cll))
+#endif
+    {
+        res = nvenc_add_hdr10_sei(avctx, frame, &sei_count);
+        if (res < 0)
+            goto error;
     }
 
     if (!ctx->udu_sei)
@@ -3046,72 +3205,252 @@ static int nvenc_set_mastering_display_data(AVCodecContext *avctx, const AVFrame
                                             MASTERING_DISPLAY_INFO *mastering_disp_info, CONTENT_LIGHT_LEVEL *content_light_level)
 {
     NvencContext *ctx = avctx->priv_data;
+    const AVFrameSideData *sd_mdm;
+    const AVFrameSideData *sd_cll;
+    const int chroma_den   = (avctx->codec->id == AV_CODEC_ID_AV1) ? 1 << 16 : 50000;
+    const int max_luma_den = (avctx->codec->id == AV_CODEC_ID_AV1) ? 1 << 8  : 10000;
+    const int min_luma_den = (avctx->codec->id == AV_CODEC_ID_AV1) ? 1 << 14 : 10000;
 
-    if (ctx->mdm || ctx->cll) {
-        const AVFrameSideData *sd_mdm = av_frame_get_side_data(frame, AV_FRAME_DATA_MASTERING_DISPLAY_METADATA);
-        const AVFrameSideData *sd_cll = av_frame_get_side_data(frame, AV_FRAME_DATA_CONTENT_LIGHT_LEVEL);
-        const int chroma_den   = (avctx->codec->id == AV_CODEC_ID_AV1) ? 1 << 16 : 50000;
-        const int max_luma_den = (avctx->codec->id == AV_CODEC_ID_AV1) ? 1 << 8  : 10000;
-        const int min_luma_den = (avctx->codec->id == AV_CODEC_ID_AV1) ? 1 << 14 : 10000;
+    /* Native pMasteringDisplay/pMaxCll only work if enabled at encoder init. */
+    if (!ctx->mdm && !ctx->cll)
+        return 0;
 
-        if (!sd_mdm)
-            sd_mdm = av_frame_side_data_get(avctx->decoded_side_data,
-                                            avctx->nb_decoded_side_data,
-                                            AV_FRAME_DATA_MASTERING_DISPLAY_METADATA);
-        if (!sd_cll)
-            sd_cll = av_frame_side_data_get(avctx->decoded_side_data,
-                                            avctx->nb_decoded_side_data,
-                                            AV_FRAME_DATA_CONTENT_LIGHT_LEVEL);
+    sd_mdm = av_frame_get_side_data(frame, AV_FRAME_DATA_MASTERING_DISPLAY_METADATA);
+    sd_cll = av_frame_get_side_data(frame, AV_FRAME_DATA_CONTENT_LIGHT_LEVEL);
 
-        if (sd_mdm) {
-            const AVMasteringDisplayMetadata *mdm = (AVMasteringDisplayMetadata *)sd_mdm->data;
+    if (!sd_mdm)
+        sd_mdm = av_frame_side_data_get(avctx->decoded_side_data,
+                                        avctx->nb_decoded_side_data,
+                                        AV_FRAME_DATA_MASTERING_DISPLAY_METADATA);
+    if (!sd_cll)
+        sd_cll = av_frame_side_data_get(avctx->decoded_side_data,
+                                        avctx->nb_decoded_side_data,
+                                        AV_FRAME_DATA_CONTENT_LIGHT_LEVEL);
 
-            mastering_disp_info->r.x = av_rescale(mdm->display_primaries[0][0].num, chroma_den,
-                                                  mdm->display_primaries[0][0].den);
-            mastering_disp_info->r.y = av_rescale(mdm->display_primaries[0][1].num, chroma_den,
-                                                  mdm->display_primaries[0][1].den);
-            mastering_disp_info->g.x = av_rescale(mdm->display_primaries[1][0].num, chroma_den,
-                                                  mdm->display_primaries[1][0].den);
-            mastering_disp_info->g.y = av_rescale(mdm->display_primaries[1][1].num, chroma_den,
-                                                  mdm->display_primaries[1][1].den);
-            mastering_disp_info->b.x = av_rescale(mdm->display_primaries[2][0].num, chroma_den,
-                                                  mdm->display_primaries[2][0].den);
-            mastering_disp_info->b.y = av_rescale(mdm->display_primaries[2][1].num, chroma_den,
-                                                  mdm->display_primaries[2][1].den);
-            mastering_disp_info->whitePoint.x = av_rescale(mdm->white_point[0].num, chroma_den,
-                                                           mdm->white_point[0].den);
-            mastering_disp_info->whitePoint.y = av_rescale(mdm->white_point[1].num, chroma_den,
-                                                           mdm->white_point[1].den);
-            mastering_disp_info->maxLuma       = av_rescale(mdm->max_luminance.num, max_luma_den,
-                                                            mdm->max_luminance.den);
-            mastering_disp_info->minLuma       = av_rescale(mdm->min_luminance.num, min_luma_den,
-                                                            mdm->min_luminance.den);
+    if (sd_mdm && ctx->mdm) {
+        const AVMasteringDisplayMetadata *mdm = (AVMasteringDisplayMetadata *)sd_mdm->data;
 
-            if (avctx->codec->id == AV_CODEC_ID_HEVC)
-                pic_params->codecPicParams.hevcPicParams.pMasteringDisplay = mastering_disp_info;
-            else if (avctx->codec->id == AV_CODEC_ID_AV1)
-                pic_params->codecPicParams.av1PicParams.pMasteringDisplay  = mastering_disp_info;
-            else
-                return AVERROR_BUG;
-        }
-        if (sd_cll) {
-            const AVContentLightMetadata *cll = (AVContentLightMetadata *)sd_cll->data;
+        mastering_disp_info->r.x = av_rescale(mdm->display_primaries[0][0].num, chroma_den,
+                                              mdm->display_primaries[0][0].den);
+        mastering_disp_info->r.y = av_rescale(mdm->display_primaries[0][1].num, chroma_den,
+                                              mdm->display_primaries[0][1].den);
+        mastering_disp_info->g.x = av_rescale(mdm->display_primaries[1][0].num, chroma_den,
+                                              mdm->display_primaries[1][0].den);
+        mastering_disp_info->g.y = av_rescale(mdm->display_primaries[1][1].num, chroma_den,
+                                              mdm->display_primaries[1][1].den);
+        mastering_disp_info->b.x = av_rescale(mdm->display_primaries[2][0].num, chroma_den,
+                                              mdm->display_primaries[2][0].den);
+        mastering_disp_info->b.y = av_rescale(mdm->display_primaries[2][1].num, chroma_den,
+                                              mdm->display_primaries[2][1].den);
+        mastering_disp_info->whitePoint.x = av_rescale(mdm->white_point[0].num, chroma_den,
+                                                       mdm->white_point[0].den);
+        mastering_disp_info->whitePoint.y = av_rescale(mdm->white_point[1].num, chroma_den,
+                                                       mdm->white_point[1].den);
+        mastering_disp_info->maxLuma       = av_rescale(mdm->max_luminance.num, max_luma_den,
+                                                        mdm->max_luminance.den);
+        mastering_disp_info->minLuma       = av_rescale(mdm->min_luminance.num, min_luma_den,
+                                                        mdm->min_luminance.den);
 
-            content_light_level->maxContentLightLevel    = cll->MaxCLL;
-            content_light_level->maxPicAverageLightLevel = cll->MaxFALL;
+        if (avctx->codec->id == AV_CODEC_ID_HEVC)
+            pic_params->codecPicParams.hevcPicParams.pMasteringDisplay = mastering_disp_info;
+        else if (avctx->codec->id == AV_CODEC_ID_AV1)
+            pic_params->codecPicParams.av1PicParams.pMasteringDisplay  = mastering_disp_info;
+        else
+            return AVERROR_BUG;
+    }
+    if (sd_cll && ctx->cll) {
+        const AVContentLightMetadata *cll = (AVContentLightMetadata *)sd_cll->data;
 
-            if (avctx->codec->id == AV_CODEC_ID_HEVC)
-                pic_params->codecPicParams.hevcPicParams.pMaxCll = content_light_level;
-            else if (avctx->codec->id == AV_CODEC_ID_AV1)
-                pic_params->codecPicParams.av1PicParams.pMaxCll  = content_light_level;
-            else
-                return AVERROR_BUG;
-        }
+        content_light_level->maxContentLightLevel    = cll->MaxCLL;
+        content_light_level->maxPicAverageLightLevel = cll->MaxFALL;
+
+        if (avctx->codec->id == AV_CODEC_ID_HEVC)
+            pic_params->codecPicParams.hevcPicParams.pMaxCll = content_light_level;
+        else if (avctx->codec->id == AV_CODEC_ID_AV1)
+            pic_params->codecPicParams.av1PicParams.pMaxCll  = content_light_level;
+        else
+            return AVERROR_BUG;
     }
 
     return 0;
 }
 #endif
+
+static int nvenc_setup_roi_qp_map(AVCodecContext *avctx, const AVFrame *frame,
+                                  NV_ENC_PIC_PARAMS *pic_params)
+{
+#ifdef NVENC_HAVE_QP_MAP_MODE
+    NvencContext *ctx = avctx->priv_data;
+    const AVFrameSideData *sd;
+    const uint8_t *end;
+    int block, map_w, map_h, x, y;
+    int input_w, input_h;
+    uint32_t map_size;
+    int roi_count = 0;
+    int logged_roi = 0;
+    int log_this_frame;
+    int nonzero_blocks = 0;
+    int min_value = 0;
+    int max_value = 0;
+
+    if (!ctx->roi_qp_map) {
+        if (ctx->roi_qp_log_frames < 3) {
+            av_log(avctx, AV_LOG_INFO,
+                   "ROI map: disabled for this encoder, pass -roi_qp_map 1 to enable\n");
+            ctx->roi_qp_log_frames++;
+        }
+        return 0;
+    }
+
+    if (!frame) {
+        av_log(avctx, AV_LOG_INFO, "ROI map: skip null/EOS frame\n");
+        return 0;
+    }
+
+    log_this_frame = ctx->roi_qp_log_frames < 50 || !(ctx->roi_qp_log_frames % 25);
+    ctx->roi_qp_log_frames++;
+    if (log_this_frame)
+        av_log(avctx, AV_LOG_INFO,
+               "ROI map: enter pts=%"PRId64" input=%ux%u frame=%dx%d mode=%d strength=%d\n",
+               frame->pts, pic_params->inputWidth, pic_params->inputHeight,
+               frame->width, frame->height, ctx->roi_qp_map_mode,
+               ctx->roi_qp_delta_strength);
+
+    input_w = pic_params->inputWidth  ? pic_params->inputWidth  :
+              frame->width            ? frame->width            : avctx->width;
+    input_h = pic_params->inputHeight ? pic_params->inputHeight :
+              frame->height           ? frame->height           : avctx->height;
+
+    /*
+     * NVENC qpDeltaMap is one signed byte per H.264 MB or per HEVC/AV1 CTB.
+     * HEVC maxCUSize is currently limited to 32x32 in bundled SDK headers;
+     * AV1 uses the same 32-block grid for map sizing.
+     */
+    block = avctx->codec_id == AV_CODEC_ID_H264 ? 16 : 32;
+    map_w = (input_w + block - 1) / block;
+    map_h = (input_h + block - 1) / block;
+    map_size = map_w * map_h;
+    if (map_w <= 0 || map_h <= 0 || map_size == 0) {
+        av_log(avctx, AV_LOG_WARNING,
+               "ROI map: invalid map size input=%dx%d pic=%ux%u frame=%dx%d avctx=%dx%d block=%d map=%dx%d\n",
+               input_w, input_h, pic_params->inputWidth, pic_params->inputHeight,
+               frame->width, frame->height, avctx->width, avctx->height,
+               block, map_w, map_h);
+        return 0;
+    }
+
+    if (!ctx->roi_qp_delta_map || ctx->roi_qp_delta_map_size < map_size) {
+        av_freep(&ctx->roi_qp_delta_map);
+        ctx->roi_qp_delta_map = av_mallocz(map_size);
+        if (!ctx->roi_qp_delta_map)
+            return AVERROR(ENOMEM);
+        ctx->roi_qp_delta_map_size = map_size;
+    } else {
+        memset(ctx->roi_qp_delta_map, 0, map_size);
+    }
+
+    pic_params->qpDeltaMap = ctx->roi_qp_delta_map;
+    pic_params->qpDeltaMapSize = map_size;
+
+    sd = av_frame_get_side_data(frame, AV_FRAME_DATA_REGIONS_OF_INTEREST);
+    if (!sd || !sd->data || sd->size < sizeof(AVRegionOfInterest)) {
+        if (log_this_frame)
+            av_log(avctx, AV_LOG_INFO,
+                   "ROI map: pts=%"PRId64" no ROI side data, map=%dx%d size=%u\n",
+                   frame->pts, map_w, map_h, map_size);
+        return 0;
+    }
+
+    if (log_this_frame)
+        av_log(avctx, AV_LOG_INFO,
+               "ROI map: pts=%"PRId64" side_data_size=%d map=%dx%d block=%d mode=%d strength=%d\n",
+               frame->pts, (int)sd->size, map_w, map_h, block,
+               ctx->roi_qp_map_mode, ctx->roi_qp_delta_strength);
+
+    end = sd->data + sd->size;
+    for (const uint8_t *ptr = sd->data; ptr + sizeof(AVRegionOfInterest) <= end; ) {
+        const AVRegionOfInterest *roi = (const AVRegionOfInterest *)ptr;
+        int left, right, top, bottom;
+        int delta, value;
+
+        if (roi->self_size < sizeof(*roi) || ptr + roi->self_size > end) {
+            av_log(avctx, AV_LOG_WARNING,
+                   "ROI map: invalid roi self_size=%u remaining=%d, stop parse\n",
+                   roi->self_size, (int)(end - ptr));
+            break;
+        }
+        if (!roi->qoffset.den) {
+            av_log(avctx, AV_LOG_WARNING,
+                   "ROI map: skip roi with zero qoffset.den (l=%d t=%d r=%d b=%d)\n",
+                   roi->left, roi->top, roi->right, roi->bottom);
+            ptr += roi->self_size;
+            continue;
+        }
+
+        delta = av_clip((int)av_rescale(roi->qoffset.num,
+                                        ctx->roi_qp_delta_strength,
+                                        roi->qoffset.den),
+                        -51, 51);
+        if (ctx->roi_qp_map_mode == NV_ENC_QP_MAP_EMPHASIS) {
+            int emphasis = av_clip((-delta + 3) / 4, 0, 5);
+            value = emphasis;
+        } else {
+            value = delta;
+        }
+
+        left = av_clip(roi->left / block, 0, map_w - 1);
+        right = av_clip((roi->right + block - 1) / block, left + 1, map_w);
+        top = av_clip(roi->top / block, 0, map_h - 1);
+        bottom = av_clip((roi->bottom + block - 1) / block, top + 1, map_h);
+
+        roi_count++;
+        if (log_this_frame && logged_roi < 4) {
+            av_log(avctx, AV_LOG_INFO,
+                   "ROI map: roi#%d px=[%d,%d,%d,%d] blk=[%d,%d,%d,%d] qoffset=%d/%d delta=%d val=%d\n",
+                   roi_count, roi->left, roi->top, roi->right, roi->bottom,
+                   left, top, right, bottom,
+                   roi->qoffset.num, roi->qoffset.den, delta, value);
+            logged_roi++;
+        }
+
+        for (y = top; y < bottom; y++) {
+            for (x = left; x < right; x++) {
+                int idx = y * map_w + x;
+                if (idx < 0 || idx >= (int)map_size)
+                    continue;
+                if (ctx->roi_qp_map_mode == NV_ENC_QP_MAP_EMPHASIS)
+                    ctx->roi_qp_delta_map[idx] = FFMAX(ctx->roi_qp_delta_map[idx], value);
+                else if (!ctx->roi_qp_delta_map[idx] || value < ctx->roi_qp_delta_map[idx])
+                    ctx->roi_qp_delta_map[idx] = value;
+            }
+        }
+
+        ptr += roi->self_size;
+    }
+
+    for (y = 0; y < (int)map_size; y++) {
+        int v = ctx->roi_qp_delta_map[y];
+        if (v) {
+            if (!nonzero_blocks) {
+                min_value = v;
+                max_value = v;
+            } else {
+                min_value = FFMIN(min_value, v);
+                max_value = FFMAX(max_value, v);
+            }
+            nonzero_blocks++;
+        }
+    }
+
+    if (log_this_frame)
+        av_log(avctx, AV_LOG_INFO,
+               "ROI map: pts=%"PRId64" applied_rois=%d qpDeltaMapSize=%u nonzero=%d min=%d max=%d\n",
+               frame->pts, roi_count, pic_params->qpDeltaMapSize,
+               nonzero_blocks, min_value, max_value);
+
+#endif
+    return 0;
+}
 
 static int nvenc_send_frame(AVCodecContext *avctx, const AVFrame *frame)
 {
@@ -3245,6 +3584,10 @@ static int nvenc_send_frame(AVCodecContext *avctx, const AVFrame *frame)
 #endif
 
         res = nvenc_store_frame_data(avctx, &pic_params, frame);
+        if (res < 0)
+            return res;
+
+        res = nvenc_setup_roi_qp_map(avctx, frame, &pic_params);
         if (res < 0)
             return res;
 

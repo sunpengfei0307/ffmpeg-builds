@@ -28,7 +28,9 @@
 #endif
 
 #include "ffmpeg.h"
+#include "ffmpeg_monitor.h"
 #include "ffmpeg_sched.h"
+#include "ffmpeg_sei.h"
 #include "cmdutils.h"
 #include "opt_common.h"
 
@@ -1546,6 +1548,8 @@ int ffmpeg_parse_options(int argc, char **argv, Scheduler *sch)
     if (ret < 0)
         goto fail;
 
+    ffmpeg_monitor_init();
+
 fail:
     for (int i = 0; i < go.nb_filtergraphs; i++)
         av_freep(&go.filtergraphs[i]);
@@ -1574,6 +1578,15 @@ static int opt_progress(void *optctx, const char *opt, const char *arg)
     }
     progress_avio = avio;
     return 0;
+}
+
+static int opt_avs_poster_zmq_url(void *optctx, const char *opt, const char *arg)
+{
+    (void)optctx;
+    (void)opt;
+    av_free(avs_poster_zmq_url);
+    avs_poster_zmq_url = av_strdup(arg);
+    return avs_poster_zmq_url ? 0 : AVERROR(ENOMEM);
 }
 
 int opt_timelimit(void *optctx, const char *opt, const char *arg)
@@ -2195,6 +2208,21 @@ const OptionDef options[] = {
         { .func_arg = opt_vsync },
         "set video sync method globally; deprecated, use -fps_mode", "" },
 #endif
+
+    { "abnormal_timeout",       OPT_TYPE_INT, OPT_EXPERT,
+        { &abnormal_timeout },
+        "max abnormal timeout for waiting loop (seconds)", "seconds" },
+    { "avs_poster_zmq_url",     OPT_TYPE_FUNC, OPT_FUNC_ARG | OPT_EXPERT,
+        { .func_arg = opt_avs_poster_zmq_url },
+        "ZMQ PUB url for status poster", "url" },
+    { "task_id",                OPT_TYPE_INT, OPT_EXPERT,
+        { &task_id },
+        "ppc/pgc task id; enables status poster "
+        "(default url ipc:///data/LCMS/sock/<id>_running_status.sock "
+        "unless -avs_poster_zmq_url is set)", "id" },
+    { "copy_sei",               OPT_TYPE_INT, OPT_EXPERT,
+        { &copy_sei },
+        "copy user SEI from demux to mux", "bool" },
 
     { NULL, },
 };

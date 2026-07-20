@@ -326,6 +326,17 @@ typedef struct NvencContext
     int cbr_padding;
     int multiview, multiview_supported;
     int display_sei_sent;
+
+    /* ROI QP map (AV_FRAME_DATA_REGIONS_OF_INTEREST) */
+    int roi_qp_map;
+    int roi_qp_map_mode;
+    int roi_qp_delta_strength;
+    int8_t *roi_qp_delta_map;
+    uint32_t roi_qp_delta_map_size;
+    int roi_qp_log_frames;
+
+    /* VBR max/vbv scale relative to averageBitRate */
+    double b_scale_ratio;
 } NvencContext;
 
 int ff_nvenc_encode_init(AVCodecContext *avctx);

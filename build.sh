@@ -29,6 +29,9 @@
 #   USE_HOST_TOOLCHAIN=1 系统 gcc（默认）
 #   VERBOSE=1            控制台同步详细日志
 #   FFBUILD_PYTHON=...   指定主机 Python（默认优先较新版本）
+#   FFMPEG_SRC           由本脚本写死为 $FFMPEG_DIR（勿依赖外部环境）
+#   SKIP_DETECT_CUDA_TRT=1  跳过 detect_cuda TensorRT 插件编译
+#   REQUIRE_DETECT_CUDA_TRT=1  插件编译失败则整次构建失败（默认仅警告）
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -74,6 +77,8 @@ print_help() {
   USE_HOST_TOOLCHAIN=1 系统 gcc（默认）
   VERBOSE=1            控制台详细输出
   FFBUILD_PYTHON=...   指定主机 Python
+  SKIP_DETECT_CUDA_TRT=1       跳过 utils/build-detect-cuda-trt.sh
+  REQUIRE_DETECT_CUDA_TRT=1    TensorRT 插件失败则构建失败（默认仅警告）
 
 导入脚本:
   1) 持久接入: 在 utils/scripts/ 新增 NN-name.sh（实现 ffbuild_build + ffbuild_configure），并在 utils/scripts/zz-final.sh 的 ffbuild_depends 中声明
@@ -153,6 +158,8 @@ main() {
   _log_init "$@"
   _paths_init
   _init_ff_vars
+  # TRT 插件等脚本用；写死为本仓库 FFmpeg 源码树，避免外部环境指到错误路径
+  export FFMPEG_SRC="$FFMPEG_DIR"
   # 必须尽早安装，否则依赖阶段 tee|while 会吞掉 Ctrl+C
   _ff_interrupt_setup
   export WORK_DIR TARGET VARIANT ADDINS_STR OUTPUT_DIR="$USR_DIR"
@@ -188,12 +195,19 @@ main() {
     stage_build_ffmpeg || { _fail "编译 FFmpeg 阶段"; exit 1; }
   fi
 
+  # detect_cuda TensorRT 插件（输出到 $FFBUILD_PREFIX/lib）
+  # 默认插件失败仅警告；REQUIRE_DETECT_CUDA_TRT=1 时失败则退出
+  stage_build_detect_cuda_trt || { _fail "detect_cuda TRT 插件阶段"; exit 1; }
+
   _banner "完成"
 
   local pc
   pc="$(_pc_count "${USR_DIR}/lib/pkgconfig")"
   _ok "build/release  pkgconfig=${pc}"
   _ok "ffmpeg: ${USR_DIR}/bin/ffmpeg"
+  if [[ -f "${USR_DIR}/lib/libavfilter_detect_cuda_trt.so" ]]; then
+    _ok "detect_cuda TRT: ${USR_DIR}/lib/libavfilter_detect_cuda_trt.so"
+  fi
   _info "详细日志: $BUILD_LOG"
   _log "===== build end $(date -Is) ====="
 }

@@ -82,6 +82,7 @@
 #include "compat/android/binder.h"
 #endif
 #include "ffmpeg.h"
+#include "ffmpeg_monitor.h"
 #include "ffmpeg_sched.h"
 #include "ffmpeg_utils.h"
 #include "graph/graphprint.h"
@@ -150,6 +151,7 @@ sigterm_handler(int sig)
     int ret;
     received_sigterm = sig;
     received_nb_signals++;
+    ffmpeg_monitor_set_sigterm(1);
     term_exit_sigsafe();
     if(received_nb_signals > 3) {
         ret = write(2/*STDERR_FILENO*/, "Received > 3 system signals, hard exiting\n",
@@ -313,6 +315,8 @@ const AVIOInterruptCB int_cb = { decode_interrupt_cb, NULL };
 
 static void ffmpeg_cleanup(int ret)
 {
+    ffmpeg_monitor_uninit();
+
     if ((print_graphs || print_graphs_file) && nb_output_files > 0)
         print_filtergraphs(filtergraphs, nb_filtergraphs, input_files, nb_input_files, output_files, nb_output_files);
 
@@ -569,10 +573,13 @@ void update_benchmark(const char *fmt, ...)
     }
 }
 
-static void print_report(int is_last_report, int64_t timer_start, int64_t cur_time, int64_t pts)
+static atomic_int_least64_t last_transcode_ts = ATOMIC_VAR_INIT(AV_NOPTS_VALUE);
+
+/* Returns <0 when monitor requests abort (severe 10s loss). */
+static int print_report(int is_last_report, int64_t timer_start, int64_t cur_time, int64_t pts)
 {
     AVBPrint buf, buf_script;
-    int64_t total_size = of_filesize(output_files[0]);
+    int64_t total_size = nb_output_files > 0 ? of_filesize(output_files[0]) : -1;
     int vid;
     double bitrate;
     double speed;
@@ -584,21 +591,38 @@ static void print_report(int is_last_report, int64_t timer_start, int64_t cur_ti
     const char *hours_sign;
     int ret;
     float t;
+    int use_poster = avs_poster != NULL;
+    char io_pairinfo[320] = {0};
+    char status_line[256] = {0};
+    double pts_sec = 0;
 
-    if (!print_stats && !is_last_report && !progress_avio)
-        return;
+    if (!print_stats && !is_last_report && !progress_avio && !use_poster)
+        return 0;
 
-    if (!is_last_report) {
+    /* When poster is active, 1s ITimer drives reports; skip stats_period gate. */
+    if (!is_last_report && !use_poster) {
         if (last_time == -1) {
             last_time = cur_time;
         }
         if (((cur_time - last_time) < stats_period && !first_report) ||
             (first_report && atomic_load(&nb_output_dumped) < nb_output_files))
-            return;
+            return 0;
         last_time = cur_time;
+    } else if (!is_last_report && use_poster &&
+               first_report && atomic_load(&nb_output_dumped) < nb_output_files) {
+        return 0;
     }
 
     t = (cur_time-timer_start) / 1000000.0;
+
+    if (use_poster) {
+        update_avs_poster(avs_poster, timer_start);
+        ffmpeg_monitor_format_status_line(status_line, sizeof(status_line));
+        ffmpeg_monitor_format_rdew(io_pairinfo, sizeof(io_pairinfo));
+        if (status_line[0])  msg("%s\n", status_line);
+        if (ffmpeg_monitor_check_abort(t) < 0)
+            return -1;
+    }
 
     vid = 0;
     av_bprint_init(&buf, 0, AV_BPRINT_SIZE_AUTOMATIC);
@@ -617,8 +641,12 @@ static void print_report(int is_last_report, int64_t timer_start, int64_t cur_ti
             uint64_t frame_number = atomic_load(&ost->packets_written);
 
             fps = t > 1 ? frame_number / t : 0;
-            av_bprintf(&buf, "frame=%5"PRId64" fps=%3.*f q=%3.1f ",
-                     frame_number, fps < 9.95, fps, q);
+            if (use_poster)
+                av_bprintf(&buf, "(%s) frame=%5"PRId64" fps=%3.*f q=%3.1f ",
+                           io_pairinfo, frame_number, fps < 9.95, fps, q);
+            else
+                av_bprintf(&buf, "frame=%5"PRId64" fps=%3.*f q=%3.1f ",
+                           frame_number, fps < 9.95, fps, q);
             av_bprintf(&buf_script, "frame=%"PRId64"\n", frame_number);
             av_bprintf(&buf_script, "fps=%.2f\n", fps);
             av_bprintf(&buf_script, "stream_%d_%d_q=%.1f\n",
@@ -647,14 +675,21 @@ static void print_report(int is_last_report, int64_t timer_start, int64_t cur_ti
     mins  = FFABS64U(pts) / AV_TIME_BASE / 60 % 60;
     hours = FFABS64U(pts) / AV_TIME_BASE / 3600;
     hours_sign = (pts < 0) ? "-" : "";
+    if (pts != AV_NOPTS_VALUE)
+        pts_sec = pts / (double)AV_TIME_BASE;
 
     bitrate = pts != AV_NOPTS_VALUE && pts && total_size >= 0 ? total_size * 8 / (pts / 1000.0) : -1;
     speed   = pts != AV_NOPTS_VALUE && t != 0.0 ? (double)pts / AV_TIME_BASE / t : -1;
 
     if (total_size < 0) av_bprintf(&buf, "size=N/A time=");
-    else                av_bprintf(&buf, "size=%8.0fKiB time=", total_size / 1024.0);
+    else if (use_poster) av_bprintf(&buf, "size=%8.0fkB time=", total_size / 1024.0);
+    else                 av_bprintf(&buf, "size=%8.0fKiB time=", total_size / 1024.0);
     if (pts == AV_NOPTS_VALUE) {
         av_bprintf(&buf, "N/A ");
+    } else if (use_poster) {
+        av_bprintf(&buf, "%s%02"PRId64":%02d:%02d.%02d (%.3f,%.3f)",
+                   hours_sign, hours, mins, secs, (100 * us) / AV_TIME_BASE,
+                   pts_sec, t);
     } else {
         av_bprintf(&buf, "%s%02"PRId64":%02d:%02d.%02d ",
                    hours_sign, hours, mins, secs, (100 * us) / AV_TIME_BASE);
@@ -694,17 +729,19 @@ static void print_report(int is_last_report, int64_t timer_start, int64_t cur_ti
         av_bprintf(&buf_script, "speed=%4.3gx\n", speed);
     }
 
-    secs = (int)t;
-    ms = (int)((t - secs) * 1000);
-    mins = secs / 60;
-    secs %= 60;
-    hours = mins / 60;
-    mins %= 60;
+    if (!use_poster) {
+        secs = (int)t;
+        ms = (int)((t - secs) * 1000);
+        mins = secs / 60;
+        secs %= 60;
+        hours = mins / 60;
+        mins %= 60;
+        av_bprintf(&buf, " elapsed=%"PRId64":%02d:%02d.%02d", hours, mins, secs, ms / 10);
+    }
 
-    av_bprintf(&buf, " elapsed=%"PRId64":%02d:%02d.%02d", hours, mins, secs, ms / 10);
-
-    if (print_stats || is_last_report) {
-        const char end = is_last_report ? '\n' : '\r';
+    if (print_stats || is_last_report || use_poster) {
+        /* Poster mode: always newline (merge with status lines). */
+        const char end = (is_last_report || use_poster) ? '\n' : '\r';
         if (print_stats==1 && AV_LOG_INFO > av_log_get_level()) {
             fprintf(stderr, "%s    %c", buf.str, end);
         } else
@@ -728,7 +765,27 @@ static void print_report(int is_last_report, int64_t timer_start, int64_t cur_ti
         }
     }
 
+    if (use_poster && total_size >= 0)
+        publish_avs_poster(avs_poster, total_size * 8, t);
+
     first_report = 0;
+    return 0;
+}
+
+static void async_report_printer(void *priv, void *func_args)
+{
+    ITimer *self = priv;
+    int64_t pts = atomic_load(&last_transcode_ts);
+    int ret;
+
+    (void)func_args;
+    ret = print_report(0, self->start_time, av_gettime_relative(), pts);
+    if (ret < 0 && abnormal_timeout != -1) {
+        av_log(NULL, AV_LOG_ERROR,
+               "Sorry! we get some network or performance issues in live streaming, ffmpeg will exit!\n");
+        term_exit();
+        exit(EXIT_FAILURE);
+    }
 }
 
 static void print_stream_maps(void)
@@ -902,9 +959,17 @@ static int transcode(Scheduler *sch)
     }
 
     timer_start = av_gettime_relative();
+    atomic_store(&last_transcode_ts, AV_NOPTS_VALUE);
+
+    /* Absolute 1s print + ZMQ post when status poster is enabled (align 6.1.1). */
+    if (avs_poster)
+        ffmpeg_monitor_start_report_timer(async_report_printer);
 
     while (!sch_wait(sch, stats_period, &transcode_ts)) {
         int64_t cur_time= av_gettime_relative();
+
+        ffmpeg_monitor_touch();
+        atomic_store(&last_transcode_ts, transcode_ts);
 
         if (received_nb_signals)
             break;
@@ -914,9 +979,12 @@ static int transcode(Scheduler *sch)
             if (check_keyboard_interaction(cur_time) < 0)
                 break;
 
-        /* dump report by using the output first video and audio streams */
-        print_report(0, timer_start, cur_time, transcode_ts);
+        /* Without poster: keep stats_period-gated print_report in the loop. */
+        if (!avs_poster)
+            print_report(0, timer_start, cur_time, transcode_ts);
     }
+
+    ffmpeg_monitor_stop_report_timer();
 
     ret = sch_stop(sch, &transcode_ts);
 
@@ -929,7 +997,8 @@ static int transcode(Scheduler *sch)
     term_exit();
 
     /* dump report by using the first video and audio streams */
-    print_report(1, timer_start, av_gettime_relative(), transcode_ts);
+    print_report(1, timer_start, av_gettime_relative(),
+                 atomic_load(&last_transcode_ts));
 
     return ret;
 }

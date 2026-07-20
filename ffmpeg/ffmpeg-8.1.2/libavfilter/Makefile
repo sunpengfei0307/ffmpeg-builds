@@ -262,6 +262,7 @@ OBJS-$(CONFIG_COREIMAGE_FILTER)              += vf_coreimage.o
 OBJS-$(CONFIG_CORR_FILTER)                   += vf_corr.o framesync.o
 OBJS-$(CONFIG_COVER_RECT_FILTER)             += vf_cover_rect.o lavfutils.o
 OBJS-$(CONFIG_CROP_FILTER)                   += vf_crop.o
+OBJS-$(CONFIG_CROP_CUDA_FILTER)              += vf_crop_cuda.o vf_crop_cuda.ptx.o cuda/load_helper.o
 OBJS-$(CONFIG_CROPDETECT_FILTER)             += vf_cropdetect.o edge_common.o
 OBJS-$(CONFIG_CUE_FILTER)                    += f_cue.o
 OBJS-$(CONFIG_CURVES_FILTER)                 += vf_curves.o
@@ -287,6 +288,8 @@ OBJS-$(CONFIG_DESHAKE_OPENCL_FILTER)        += vf_deshake_opencl.o opencl.o \
 OBJS-$(CONFIG_DESHAKE_FILTER)                += vf_deshake.o transform.o
 OBJS-$(CONFIG_DESPILL_FILTER)                += vf_despill.o
 OBJS-$(CONFIG_DETELECINE_FILTER)             += vf_detelecine.o
+OBJS-$(CONFIG_DETECT_CUDA_FILTER)            += vf_detect_cuda.o vf_detect_cuda.ptx.o \
+                                                vf_detect_cuda_trt_loader.o cuda/load_helper.o
 OBJS-$(CONFIG_DILATION_FILTER)               += vf_neighbor.o
 OBJS-$(CONFIG_DILATION_OPENCL_FILTER)        += vf_neighbor_opencl.o opencl.o \
                                                 opencl/neighbor.o
@@ -341,6 +344,9 @@ OBJS-$(CONFIG_GRAYWORLD_FILTER)              += vf_grayworld.o
 OBJS-$(CONFIG_GREYEDGE_FILTER)               += vf_colorconstancy.o
 OBJS-$(CONFIG_GUIDED_FILTER)                 += vf_guided.o framesync.o
 OBJS-$(CONFIG_HALDCLUT_FILTER)               += vf_lut3d.o framesync.o
+OBJS-$(CONFIG_HLG2PQ_CUDA_FILTER)            += vf_hlg2pq_cuda.o vf_hlg2pq_cuda.ptx.o \
+                                                pq_metadata.o cuda/load_helper.o
+OBJS-$(CONFIG_REPAIR_PQ_METADATA_FILTER)     += vf_repair_pq_metadata.o pq_metadata.o
 OBJS-$(CONFIG_HFLIP_FILTER)                  += vf_hflip.o
 OBJS-$(CONFIG_HFLIP_VULKAN_FILTER)           += vf_flip_vulkan.o vulkan.o
 OBJS-$(CONFIG_HISTEQ_FILTER)                 += vf_histeq.o
@@ -541,6 +547,8 @@ OBJS-$(CONFIG_TMEDIAN_FILTER)                += vf_xmedian.o framesync.o
 OBJS-$(CONFIG_TMIDEQUALIZER_FILTER)          += vf_tmidequalizer.o
 OBJS-$(CONFIG_TMIX_FILTER)                   += vf_mix.o framesync.o
 OBJS-$(CONFIG_TONEMAP_FILTER)                += vf_tonemap.o
+OBJS-$(CONFIG_TONEMAP_CUDA_FILTER)           += vf_tonemap_cuda.o vf_tonemap_cuda.ptx.o \
+                                                cuda/load_helper.o
 OBJS-$(CONFIG_TONEMAP_OPENCL_FILTER)         += vf_tonemap_opencl.o opencl.o \
                                                 opencl/tonemap.o opencl/colorspace_common.o
 OBJS-$(CONFIG_TONEMAP_VAAPI_FILTER)          += vf_tonemap_vaapi.o vaapi_vpp.o
@@ -684,6 +692,10 @@ SKIPHEADERS-$(CONFIG_OPENCL)                 += opencl.h
 SKIPHEADERS-$(CONFIG_VAAPI)                  += vaapi_vpp.h stack_internal.h
 SKIPHEADERS-$(CONFIG_VULKAN)                 += vulkan_filter.h
 SKIPHEADERS-$(CONFIG_SCALE_CUDA_FILTER)      += vf_scale_cuda.h
+SKIPHEADERS-$(CONFIG_TONEMAP_CUDA_FILTER)    += vf_tonemap_cuda.h
+SKIPHEADERS-$(CONFIG_HLG2PQ_CUDA_FILTER)     += pq_metadata.h
+SKIPHEADERS-$(CONFIG_REPAIR_PQ_METADATA_FILTER) += pq_metadata.h
+SKIPHEADERS-$(CONFIG_DETECT_CUDA_FILTER)     += vf_detect_cuda_trt.h
 
 TOOLS     = graph2dot
 TESTPROGS = drawutils filtfmts formats integral

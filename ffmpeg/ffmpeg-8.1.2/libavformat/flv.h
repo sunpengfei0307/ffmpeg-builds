@@ -103,7 +103,13 @@ enum {
     FLV_CODECID_NELLYMOSER           = 6 << FLV_AUDIO_CODECID_OFFSET,
     FLV_CODECID_PCM_ALAW             = 7 << FLV_AUDIO_CODECID_OFFSET,
     FLV_CODECID_PCM_MULAW            = 8 << FLV_AUDIO_CODECID_OFFSET,
+    /**
+     * Enhanced RTMP ExHeader SoundFormat, also used as legacy Opus (=9)
+     * by domestic CDN / iqiyi-style FLV. Demuxers must disambiguate by
+     * peeking the following FourCC vs AAC-style packet-type byte.
+     */
     FLV_CODECID_EX_HEADER            = 9 << FLV_AUDIO_CODECID_OFFSET,
+    FLV_CODECID_X_OPUS               = FLV_CODECID_EX_HEADER,
     FLV_CODECID_AAC                  = 10<< FLV_AUDIO_CODECID_OFFSET,
     FLV_CODECID_SPEEX                = 11<< FLV_AUDIO_CODECID_OFFSET,
 };
@@ -118,8 +124,11 @@ enum {
     FLV_CODECID_REALH263= 8,
     FLV_CODECID_MPEG4   = 9,
 
-    // non-standard protocol extension that is in use in the wild
+    /* non-standard numeric CodecIDs used by domestic RTMP/FLV CDNs */
     FLV_CODECID_X_HEVC  = 12,
+    FLV_CODECID_X_AV1   = 13,
+    FLV_CODECID_X_VP8   = 14,
+    FLV_CODECID_X_VP9   = 15,
 };
 
 enum {

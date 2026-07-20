@@ -478,6 +478,10 @@ typedef struct Decoder {
     uint64_t         decode_errors;
 } Decoder;
 
+/* poster sliding windows (aligned with 6.1.1 AVStream near_pkt_* / near_Idr_*) */
+#define FF_NEAR_PKT_SAMPLES 120
+#define FF_NEAR_IDR_SAMPLES 2
+
 typedef struct InputStream {
     const AVClass        *class;
 
@@ -510,6 +514,16 @@ typedef struct InputStream {
      * currently video and audio only */
     InputFilter         **filters;
     int                nb_filters;
+
+    /* demux stats mirrored for monitor/poster (updated in demux thread) */
+    uint64_t              demux_nb_packets;
+    uint64_t              demux_data_size;
+    int                   decoding_needed;
+    /* sliding window like 6.1.1 AVStream near_pkt_* / near_Idr_* */
+    int64_t               near_pkt_pts[FF_NEAR_PKT_SAMPLES];
+    int64_t               near_pkt_dts[FF_NEAR_PKT_SAMPLES];
+    int64_t               near_Idr_pts[FF_NEAR_IDR_SAMPLES];
+    int64_t               near_Idr_dts[FF_NEAR_IDR_SAMPLES];
 } InputStream;
 
 typedef struct InputStreamGroup {
@@ -686,6 +700,16 @@ typedef struct OutputStream {
     /* stats */
     // number of packets send to the muxer
     atomic_uint_least64_t packets_written;
+    uint64_t              mux_data_size;
+    /* sliding window like 6.1.1 AVStream near_pkt_* / near_Idr_* */
+    int64_t               near_pkt_pts[FF_NEAR_PKT_SAMPLES];
+    int64_t               near_pkt_dts[FF_NEAR_PKT_SAMPLES];
+    int64_t               near_Idr_pts[FF_NEAR_IDR_SAMPLES];
+    int64_t               near_Idr_dts[FF_NEAR_IDR_SAMPLES];
+
+    /* user SEI cache for copy_sei (IHtable* from spfutils) */
+    void                 *usr_sei_dict;
+    int64_t               min_sei_pts;
 
     /* packet quality factor */
     atomic_int quality;

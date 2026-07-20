@@ -14,7 +14,7 @@ SCRIPT_COMMIT3="afae1834257b919848c5deb21a17c7355616b1ee"
 SCRIPT_BRANCH3="sdk/11.1"
 
 # 可选：NVENC_SDK=13.0 强制用最新头（Blackwell 硬件平台，需驱动 ≥570）
-#        NVENC_SDK=12.2 强制用 12.2（默认，适配 Turing 及更低硬件平台）
+#        NVENC_SDK=12.4 强制用 12.4（默认，适配 Turing 及更低硬件平台）
 #        NVENC_SDK=11.1 强制用 11.1（Pascal 及更低硬件平台）
 ffbuild_enabled() {
     [[ $TARGET == winarm64 ]] && (( $(ffbuild_ffver) <= 801 )) && return -1
@@ -32,7 +32,7 @@ ffbuild_build() {
     local sdk="${NVENC_SDK:-}"
     case "$sdk" in
         13.0|13) cd ffnvcodec ;;
-        12.2|12) cd ffnvcodec2 ;;
+        12.4|12) cd ffnvcodec2 ;;
         11.1|11) cd ffnvcodec3 ;;
         "")
             # FFmpeg 8.x 默认 12.2，兼容 Driver 550；更新需 NVENC_SDK=13.0

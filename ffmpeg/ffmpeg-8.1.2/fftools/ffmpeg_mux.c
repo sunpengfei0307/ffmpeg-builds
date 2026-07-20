@@ -21,7 +21,9 @@
 #include <string.h>
 
 #include "ffmpeg.h"
+#include "ffmpeg_monitor.h"
 #include "ffmpeg_mux.h"
+#include "ffmpeg_sei.h"
 #include "ffmpeg_utils.h"
 #include "sync_queue.h"
 
@@ -221,11 +223,19 @@ static int write_packet(Muxer *mux, OutputStream *ost, AVPacket *pkt)
         goto fail;
     }
 
+    ret = ffmpeg_sei_inject_mux_pkt(ost, pkt);
+    if (ret < 0)
+        goto fail;
+
     ret = mux_fixup_ts(mux, ms, pkt);
     if (ret < 0)
         goto fail;
 
     ms->data_size_mux += pkt->size;
+    ost->mux_data_size = ms->data_size_mux;
+    /* after mux_fixup_ts: same as 6.1.1 mux.c near_pkt_* sample */
+    ffmpeg_monitor_push_pkt_ts(ost->near_pkt_pts, ost->near_pkt_dts,
+                               ost->near_Idr_pts, ost->near_Idr_dts, pkt);
     frame_num = atomic_fetch_add(&ost->packets_written, 1);
 
     pkt->stream_index = ost->index;

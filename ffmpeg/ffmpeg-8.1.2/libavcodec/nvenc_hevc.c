@@ -244,6 +244,18 @@ static const AVOption options[] = {
     { "4",                 "Enabled with number of horizontal strips forced to 4 when number of NVENCs > 3", 0, AV_OPT_TYPE_CONST, { .i64 = NV_ENC_SPLIT_FOUR_FORCED_MODE }, 0, 0, VE, .unit = "split_encode_mode" },
 #endif
 #endif
+    { "b_scale_ratio", "VBR max/vbv scale relative to average bitrate",
+                                                            OFFSET(b_scale_ratio), AV_OPT_TYPE_DOUBLE, { .dbl = 1.4 }, 0., 10., VE },
+#ifdef NVENC_HAVE_QP_MAP_MODE
+    { "roi_qp_map",   "Use AV_FRAME_DATA_REGIONS_OF_INTEREST as NVENC QP map",
+                                                            OFFSET(roi_qp_map),   AV_OPT_TYPE_BOOL,  { .i64 = 0 }, 0, 1, VE },
+    { "roi_qp_mode",  "QP map mode for ROI side data",
+                                                            OFFSET(roi_qp_map_mode), AV_OPT_TYPE_INT, { .i64 = NV_ENC_QP_MAP_DELTA }, NV_ENC_QP_MAP_EMPHASIS, NV_ENC_QP_MAP_DELTA, VE, .unit = "roi_qp_mode" },
+    { "emphasis",     "Use NVENC emphasis map mode",       0,                    AV_OPT_TYPE_CONST, { .i64 = NV_ENC_QP_MAP_EMPHASIS }, 0, 0, VE, .unit = "roi_qp_mode" },
+    { "delta",        "Use NVENC delta QP map mode",       0,                    AV_OPT_TYPE_CONST, { .i64 = NV_ENC_QP_MAP_DELTA }, 0, 0, VE, .unit = "roi_qp_mode" },
+    { "roi_qp_strength", "Scale ROI qoffset to per-block QP delta",
+                                                            OFFSET(roi_qp_delta_strength), AV_OPT_TYPE_INT, { .i64 = 24 }, 1, 51, VE },
+#endif
     { NULL }
 };
 
