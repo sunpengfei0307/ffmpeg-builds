@@ -376,8 +376,8 @@ static void del_caches(void* args) {
     }
 }
 static void cleanup(void) {del_caches(pthread_getspecific(thr_key));}
-static void make_key() { 
-    (void)pthread_key_create(&thr_key, del_caches); 
+static void make_key(void) {
+    (void)pthread_key_create(&thr_key, del_caches);
     atexit(cleanup);
 }
 static inline char* get_caches(int32_t need_size) {
@@ -406,8 +406,8 @@ static inline bool is_cacheptr(char* ptr) {
     CBuf *caches = (CBuf*)pthread_getspecific(thr_key);
     if (caches) {
         for (int32_t i=0; i<nb_caches; ++i) {
-            if (((char*)ptr >= caches[i].buf) &&
-                (char*)ptr < ((char*)caches[i].buf + caches[i].len))
+            char *base = (char *)caches[i].buf;
+            if (ptr >= base && ptr < (base + caches[i].len))
                 return true;
         }
     }
@@ -672,14 +672,13 @@ static char* strvar_alc(CVar* cvar, CAlc* alc) {
     strcpy(dst_, ptr_); free((void*)ptr_);dst_;})
 static void debug_cvar(CVar *cvar){
     Assertor(NULL != cvar);
-    CType styp = get_subtyp(cvar);
     if (is_cvararr(cvar)) {
-        int size = get_varlen(cvar); // 如果是字符串数组，获取到的是[字符串指针-数组]大小；
-        int nums = get_arrnum(cvar); // 单类型大小；
-        msg("@ is_arr=1! styp=%s, size=%d, nums=%d, arr='%s'\n", 
+        size_t size = get_varlen(cvar); // 字符串数组时为[指针数组]大小
+        size_t nums = get_arrnum(cvar);
+        msg("@ is_arr=1! styp=%s, size=%zu, nums=%zu, arr='%s'\n",
             get_subtyp_desc(cvar), size, nums, strvar_nofree(cvar));
     } else {
-        msg("@ is_arr=0! styp=%s, size=%d, nums=%d, var='%s'\n", 
+        msg("@ is_arr=0! styp=%s, size=%zu, nums=%d, var='%s'\n",
             get_subtyp_desc(cvar), get_varlen(cvar), 1, strvar_nofree(cvar));
     }
 }
@@ -807,7 +806,7 @@ htable_delete(IHtable **hashtable, int64_t key, void (*clean)(void*)) {
     HASH_FIND_INT64(*hashtable, &key, s);
     if (s != NULL) {
 		if (NULL != clean) {
-			dbg("clean key=%llu, %p\n", s->key, s->val);
+			dbg("clean key=%" PRId64 ", %p\n", s->key, s->val);
 			clean(s->val);
 		}
       HASH_DEL(*hashtable, s);
@@ -1349,9 +1348,9 @@ strarrcp(const char **arr, int32_t nums) {
     for (i=0; i<nums; ++i) {
         src_size += (arr_size[i] = strlen(arr[i])+sizeof(char));
     }
-    char *src = NULL, *p_src, **dst = NULL;
+    char *p_src, **dst = NULL;
     dst = (char**)calloc(1, dst_size + src_size);
-    src = p_src = (char*)(dst + nums+1);
+    p_src = (char*)(dst + nums+1);
     for (i=0; i<nums; ++i) {
         dst[i] = p_src;
         strcpy(p_src, arr[i]); p_src += arr_size[i];

@@ -339,3 +339,15 @@ AVIODirEntry *ff_alloc_dir_entry(void)
     }
     return entry;
 }
+
+int ffurl_process_command(URLContext *h, const char *cmd, const char *arg,
+                          char *res, int res_len, int flags)
+{
+    if (res && res_len > 0)
+        res[0] = 0;
+    if (!h || !h->prot || !cmd || !cmd[0])
+        return AVERROR(EINVAL);
+    if (!h->prot->process_command)
+        return AVERROR(ENOSYS);
+    return h->prot->process_command(h, cmd, arg, res, res_len, flags);
+}

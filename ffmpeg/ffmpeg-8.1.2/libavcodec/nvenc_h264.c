@@ -260,7 +260,7 @@ static const AVOption options[] = {
     { "emphasis",     "Use NVENC emphasis map mode",       0,                    AV_OPT_TYPE_CONST, { .i64 = NV_ENC_QP_MAP_EMPHASIS }, 0, 0, VE, .unit = "roi_qp_mode" },
     { "delta",        "Use NVENC delta QP map mode",       0,                    AV_OPT_TYPE_CONST, { .i64 = NV_ENC_QP_MAP_DELTA }, 0, 0, VE, .unit = "roi_qp_mode" },
     { "roi_qp_strength", "Scale ROI qoffset to per-block QP delta",
-                                                            OFFSET(roi_qp_delta_strength), AV_OPT_TYPE_INT, { .i64 = 24 }, 1, 51, VE },
+                                                            OFFSET(roi_qp_delta_strength), AV_OPT_TYPE_INT, { .i64 = 23 }, 1, 51, VE },
 #endif
     { NULL }
 };
@@ -306,4 +306,5 @@ const FFCodec ff_h264_nvenc_encoder = {
     .color_ranges   = AVCOL_RANGE_MPEG | AVCOL_RANGE_JPEG,
     .p.wrapper_name = "nvenc",
     .hw_configs     = ff_nvenc_hw_configs,
+    .process_command = ff_nvenc_process_command,
 };

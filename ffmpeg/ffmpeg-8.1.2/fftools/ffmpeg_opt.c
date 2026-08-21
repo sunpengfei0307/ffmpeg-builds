@@ -21,6 +21,7 @@
 #include "config.h"
 
 #include <stdint.h>
+#include <stdlib.h>
 
 #if HAVE_SYS_RESOURCE_H
 #include <sys/time.h>
@@ -91,6 +92,10 @@ static int no_file_overwrite  = 0;
 int ignore_unknown_streams = 0;
 int copy_unknown_streams = 0;
 int recast_media = 0;
+
+/* iqiyi: skip demux packets before first keyframe; multi-input NTP/wallclock sync */
+int skip_to_key = 0;
+int use_ntp = 0;
 
 // this struct is passed as the optctx argument
 // to func_arg() for global options
@@ -1589,6 +1594,33 @@ static int opt_avs_poster_zmq_url(void *optctx, const char *opt, const char *arg
     return avs_poster_zmq_url ? 0 : AVERROR(ENOMEM);
 }
 
+static int opt_zmq(void *optctx, const char *opt, const char *arg)
+{
+    (void)optctx;
+    (void)opt;
+    av_free(ffmpeg_zmq_url);
+    ffmpeg_zmq_url = av_strdup(arg);
+    return ffmpeg_zmq_url ? 0 : AVERROR(ENOMEM);
+}
+
+/* Export task_id for lavfi filters (gain/cmd ipc sock) before filtergraph init. */
+static int opt_task_id(void *optctx, const char *opt, const char *arg)
+{
+    char buf[32];
+    (void)optctx;
+    (void)opt;
+    task_id = atoi(arg);
+    if (task_id != 0) {
+        snprintf(buf, sizeof(buf), "%d", task_id);
+#ifdef _WIN32
+        _putenv_s("FFMPEG_TASK_ID", buf);
+#else
+        setenv("FFMPEG_TASK_ID", buf, 1);
+#endif
+    }
+    return 0;
+}
+
 int opt_timelimit(void *optctx, const char *opt, const char *arg)
 {
 #if HAVE_SETRLIMIT
@@ -1624,6 +1656,15 @@ static int opt_adrift_threshold(void *optctx, const char *opt, const char *arg)
     return 0;
 }
 #endif
+
+/* iqiyi compat: older builds used this; accept and ignore. */
+static int opt_err_fps_trigger_threshold(void *optctx, const char *opt, const char *arg)
+{
+    (void)optctx;
+    (void)opt;
+    (void)arg;
+    return 0;
+}
 
 static const char *const alt_channel_layout[] = { "ch_layout", NULL};
 static const char *const alt_codec[]          = { "c", "acodec", "vcodec", "scodec", "dcodec", NULL };
@@ -2212,17 +2253,30 @@ const OptionDef options[] = {
     { "abnormal_timeout",       OPT_TYPE_INT, OPT_EXPERT,
         { &abnormal_timeout },
         "max abnormal timeout for waiting loop (seconds)", "seconds" },
+    { "err_fps_trigger_threshold", OPT_TYPE_FUNC, OPT_FUNC_ARG | OPT_EXPERT,
+        { .func_arg = opt_err_fps_trigger_threshold },
+        "compatibility stub (ignored)", "threshold" },
     { "avs_poster_zmq_url",     OPT_TYPE_FUNC, OPT_FUNC_ARG | OPT_EXPERT,
         { .func_arg = opt_avs_poster_zmq_url },
         "ZMQ PUB url for status poster", "url" },
-    { "task_id",                OPT_TYPE_INT, OPT_EXPERT,
-        { &task_id },
+    { "zmq",                    OPT_TYPE_FUNC, OPT_FUNC_ARG | OPT_EXPERT,
+        { .func_arg = opt_zmq },
+        "process-level ZMQ REP for filter/codec/format/protocol/fftools "
+        "(does not replace graph zmq/azmq)", "url" },
+    { "task_id",                OPT_TYPE_FUNC, OPT_FUNC_ARG | OPT_EXPERT,
+        { .func_arg = opt_task_id },
         "ppc/pgc task id; enables status poster "
-        "(default url ipc:///data/LCMS/sock/<id>_running_status.sock "
-        "unless -avs_poster_zmq_url is set)", "id" },
+        "(default ipc:///data/LCMS/sock/<id>_running_status.sock) and "
+        "lavfi gain/cmd socks ipc:///data/LCMS/sock/gain_<id>.sock / cmd_<id>.sock", "id" },
     { "copy_sei",               OPT_TYPE_INT, OPT_EXPERT,
         { &copy_sei },
         "copy user SEI from demux to mux", "bool" },
+    { "skip_to_key",            OPT_TYPE_BOOL, OPT_EXPERT,
+        { &skip_to_key },
+        "skip packets before the first keyframe appears" },
+    { "use_ntp",                OPT_TYPE_INT, OPT_EXPERT,
+        { &use_ntp },
+        "use wallclock/NTP timestamps to sync multiple inputs (sets use_wallclock_as_timestamps, keeps absolute timeline)", "bool" },
 
     { NULL, },
 };

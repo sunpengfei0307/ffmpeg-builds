@@ -31,6 +31,8 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
+#include <stdio.h>
 #include <time.h>
 
 #if HAVE_IO_H
@@ -71,6 +73,7 @@
 #include "libavutil/bprint.h"
 #include "libavutil/dict.h"
 #include "libavutil/mem.h"
+#include "libavutil/avstring.h"
 #include "libavutil/time.h"
 
 #include "libavformat/avformat.h"
@@ -159,6 +162,52 @@ sigterm_handler(int sig)
         if (ret < 0) { /* Do nothing */ };
         exit(123);
     }
+}
+
+void ffmpeg_request_quit(void)
+{
+    received_nb_signals++;
+}
+
+int ffmpeg_process_command(const char *cmd, const char *arg, char *res, int res_len)
+{
+    if (res && res_len > 0)
+        res[0] = 0;
+    if (!cmd || !cmd[0])
+        return AVERROR(EINVAL);
+    if (!arg)
+        arg = "";
+    if (!strcmp(cmd, "quit") || !strcmp(cmd, "q") || !strcmp(cmd, "exit")) {
+        ffmpeg_request_quit();
+        if (res)
+            av_strlcpy(res, "quit", res_len);
+        return 0;
+    }
+    if (!strcmp(cmd, "loglevel")) {
+        static const struct { const char *n; int l; } tab[] = {
+            { "quiet",   AV_LOG_QUIET   },
+            { "panic",   AV_LOG_PANIC   },
+            { "fatal",   AV_LOG_FATAL   },
+            { "error",   AV_LOG_ERROR   },
+            { "warning", AV_LOG_WARNING },
+            { "info",    AV_LOG_INFO    },
+            { "verbose", AV_LOG_VERBOSE },
+            { "debug",   AV_LOG_DEBUG   },
+            { "trace",   AV_LOG_TRACE   },
+        };
+        int i, lvl = atoi(arg);
+        if (arg[0] && !isdigit((unsigned char)arg[0])) {
+            lvl = AV_LOG_INFO;
+            for (i = 0; i < (int)FF_ARRAY_ELEMS(tab); i++)
+                if (!strcmp(arg, tab[i].n))
+                    lvl = tab[i].l;
+        }
+        av_log_set_level(lvl);
+        if (res)
+            snprintf(res, res_len, "loglevel=%d", av_log_get_level());
+        return 0;
+    }
+    return AVERROR(ENOSYS);
 }
 
 #if HAVE_SETCONSOLECTRLHANDLER
@@ -349,6 +398,9 @@ static void ffmpeg_cleanup(int ret)
     of_enc_stats_close();
 
     hw_device_free_all();
+
+    ffmpeg_zmq_uninit();
+    av_freep(&ffmpeg_zmq_url);
 
     av_freep(&filter_nbthreads);
 
@@ -954,6 +1006,10 @@ static int transcode(Scheduler *sch)
     if (ret < 0)
         return ret;
 
+    ret = ffmpeg_zmq_init(ffmpeg_zmq_url);
+    if (ret < 0)
+        av_log(NULL, AV_LOG_ERROR, "process ZMQ init failed: %s\n", av_err2str(ret));
+
     if (stdin_interaction) {
         av_log(NULL, AV_LOG_INFO, "Press [q] to stop, [?] for help\n");
     }
@@ -985,6 +1041,8 @@ static int transcode(Scheduler *sch)
     }
 
     ffmpeg_monitor_stop_report_timer();
+
+    ffmpeg_zmq_uninit();
 
     ret = sch_stop(sch, &transcode_ts);
 

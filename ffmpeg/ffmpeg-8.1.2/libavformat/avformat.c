@@ -908,3 +908,23 @@ int ff_format_io_close(AVFormatContext *s, AVIOContext **pb)
     *pb = NULL;
     return ret;
 }
+
+int avformat_process_command(AVFormatContext *s, const char *cmd, const char *arg,
+                             char *res, int res_len, int flags)
+{
+    if (res && res_len > 0)
+        res[0] = 0;
+    if (!s || !cmd || !cmd[0])
+        return AVERROR(EINVAL);
+    if (s->oformat) {
+        const FFOutputFormat *of = ffofmt(s->oformat);
+        if (of && of->process_command)
+            return of->process_command(s, cmd, arg, res, res_len, flags);
+    }
+    if (s->iformat) {
+        const FFInputFormat *inf = ffifmt(s->iformat);
+        if (inf && inf->process_command)
+            return inf->process_command(s, cmd, arg, res, res_len, flags);
+    }
+    return AVERROR(ENOSYS);
+}

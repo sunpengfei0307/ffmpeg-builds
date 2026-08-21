@@ -2025,6 +2025,9 @@ int ifile_open(const OptionsContext *o, const char *filename, Scheduler *sch)
         av_dict_set(&o->g->format_opts, "scan_all_pmts", "1", AV_DICT_DONT_OVERWRITE);
         scan_all_pmts_set = 1;
     }
+    /* Multi-input live sync: stamp packets with wallclock (NTP-synced host clock). */
+    if (use_ntp)
+        av_dict_set(&o->g->format_opts, "use_wallclock_as_timestamps", "1", 0);
     /* open the input file with generic avformat function */
     err = avformat_open_input(&ic, filename, file_iformat, &o->g->format_opts);
     if (err < 0) {
@@ -2069,6 +2072,8 @@ int ifile_open(const OptionsContext *o, const char *filename, Scheduler *sch)
 
         /* If not enough info to get the stream parameters, we decode the
            first frames to get it. (used in mpeg case for example) */
+        if (skip_to_key && opts && orig_nb_streams > 0)
+            av_dict_set_int(&opts[0], "skip_to_key", 1, 0);
         ret = avformat_find_stream_info(ic, opts);
 
         for (int i = 0; i < orig_nb_streams; i++)
@@ -2134,7 +2139,11 @@ int ifile_open(const OptionsContext *o, const char *filename, Scheduler *sch)
     d->recording_time = recording_time;
     f->input_sync_ref = o->input_sync_ref;
     f->input_ts_offset = o->input_ts_offset;
-    f->ts_offset  = o->input_ts_offset - (copy_ts ? (start_at_zero && ic->start_time != AV_NOPTS_VALUE ? ic->start_time : 0) : timestamp);
+    /* use_ntp keeps absolute wallclock timeline across inputs (like -copyts). */
+    if (use_ntp)
+        f->ts_offset = o->input_ts_offset;
+    else
+        f->ts_offset  = o->input_ts_offset - (copy_ts ? (start_at_zero && ic->start_time != AV_NOPTS_VALUE ? ic->start_time : 0) : timestamp);
     d->accurate_seek   = o->accurate_seek;
     d->loop = o->loop;
     d->nb_streams_warn = ic->nb_streams;

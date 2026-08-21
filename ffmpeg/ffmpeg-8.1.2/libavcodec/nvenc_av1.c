@@ -240,4 +240,5 @@ const FFCodec ff_av1_nvenc_encoder = {
                       FF_CODEC_CAP_INIT_CLEANUP,
     .p.wrapper_name = "nvenc",
     .hw_configs     = ff_nvenc_hw_configs,
+    .process_command = ff_nvenc_process_command,
 };

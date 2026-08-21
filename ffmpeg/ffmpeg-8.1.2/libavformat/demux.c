@@ -2863,7 +2863,64 @@ int avformat_find_stream_info(AVFormatContext *ic, AVDictionary **options)
             }
 
             /* update stored dts values */
-            if (sti->info->fps_first_dts == AV_NOPTS_VALUE) {
+            if (options && *options &&
+                av_dict_get(*options, "skip_to_key", NULL, AV_DICT_MATCH_CASE)) {
+                /* iqiyi: wait for a keyframe on every stream, then drop buffered
+                 * packets before that key DTS so demux starts on key. */
+                if (sti->info->fps_first_dts == AV_NOPTS_VALUE &&
+                    (pkt->flags & AV_PKT_FLAG_KEY)) {
+                    int j;
+                    sti->info->fps_first_dts     = pkt->dts;
+                    sti->info->fps_first_dts_idx = sti->codec_info_nb_frames;
+                    for (j = 0; j < ic->nb_streams; j++) {
+                        FFStream *sti2 = ffstream(ic->streams[j]);
+                        if (!sti2->info ||
+                            sti2->info->fps_first_dts == AV_NOPTS_VALUE)
+                            break;
+                    }
+                    if (j == ic->nb_streams) {
+                        PacketListEntry *pktl = si->packet_buffer.head;
+                        PacketListEntry *last_pktl = NULL;
+                        for (j = 0; j < ic->nb_streams; j++)
+                            ic->streams[j]->start_time = AV_NOPTS_VALUE;
+                        while (pktl) {
+                            AVPacket *bpkt = &pktl->pkt;
+                            FFStream *bsti = ffstream(ic->streams[bpkt->stream_index]);
+                            if (bpkt->dts != AV_NOPTS_VALUE && pkt->dts != AV_NOPTS_VALUE &&
+                                (bpkt->dts + bpkt->duration < pkt->dts ||
+                                 (bpkt->dts + bpkt->duration == pkt->dts &&
+                                  !(bpkt->flags & AV_PKT_FLAG_KEY)))) {
+                                if (bsti->codec_info_nb_frames > 0)
+                                    bsti->codec_info_nb_frames--;
+                                if (bsti->info && bsti->info->fps_last_dts_idx > 0)
+                                    bsti->info->fps_last_dts_idx--;
+                                if (si->packet_buffer.head == pktl) {
+                                    si->packet_buffer.head = pktl->next;
+                                    if (!si->packet_buffer.head)
+                                        si->packet_buffer.tail = NULL;
+                                    av_packet_unref(&pktl->pkt);
+                                    av_freep(&pktl);
+                                    pktl = si->packet_buffer.head;
+                                } else {
+                                    last_pktl->next = pktl->next;
+                                    if (si->packet_buffer.tail == pktl)
+                                        si->packet_buffer.tail = last_pktl;
+                                    av_packet_unref(&pktl->pkt);
+                                    av_freep(&pktl);
+                                    pktl = last_pktl->next;
+                                }
+                            } else {
+                                last_pktl = pktl;
+                                pktl = pktl->next;
+                                if (ic->streams[last_pktl->pkt.stream_index]->start_time == AV_NOPTS_VALUE &&
+                                    last_pktl->pkt.dts != AV_NOPTS_VALUE)
+                                    ic->streams[last_pktl->pkt.stream_index]->start_time =
+                                        last_pktl->pkt.dts;
+                            }
+                        }
+                    }
+                }
+            } else if (sti->info->fps_first_dts == AV_NOPTS_VALUE) {
                 sti->info->fps_first_dts     = pkt->dts;
                 sti->info->fps_first_dts_idx = sti->codec_info_nb_frames;
             }

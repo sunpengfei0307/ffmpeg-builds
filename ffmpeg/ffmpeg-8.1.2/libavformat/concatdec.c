@@ -18,6 +18,9 @@
  * 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include "config.h"
+#include "config_components.h"
+
 #include "libavutil/attributes_internal.h"
 #include "libavutil/avstring.h"
 #include "libavutil/avassert.h"
@@ -26,6 +29,7 @@
 #include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "libavutil/parseutils.h"
+#include "libavutil/time.h"
 #include "libavutil/timestamp.h"
 #include "libavcodec/codec_desc.h"
 #include "libavcodec/bsf.h"
@@ -34,6 +38,24 @@
 #include "demux.h"
 #include "internal.h"
 #include "url.h"
+
+#if HAVE_PTHREADS
+#include <pthread.h>
+#endif
+#include <string.h>
+#ifndef _WIN32
+#include <unistd.h>
+#else
+#include <io.h>
+#ifndef F_OK
+#define F_OK 0
+#endif
+#define access _access
+#endif
+
+#if CONFIG_LIBZMQ
+#include <zmq.h>
+#endif
 
 typedef enum ConcatMatchMode {
     MATCH_ONE_TO_ONE,
@@ -61,12 +83,35 @@ typedef struct {
     int nb_streams;
 } ConcatFile;
 
+#if CONFIG_LIBZMQ
+typedef struct ConcatZmqContext {
+    void *ctx;
+    void *sock;
+    char *url;
+    int   command_count;
+} ConcatZmqContext;
+#endif
+
 typedef struct {
     AVClass *class;
     ConcatFile *files;
     ConcatFile *cur_file;
     unsigned nb_files;
     AVFormatContext *avf;
+    ConcatFile *try_file;
+    AVFormatContext *try_avf;
+    char *try_url;
+    int try_stage;
+#if CONFIG_LIBZMQ
+    ConcatZmqContext *zmq_ctx;
+#endif
+    char *zmq_url;
+#if HAVE_PTHREADS
+    pthread_t thread;
+    int thread_started;
+#endif
+    int try_self;
+    int waiting;
     int safe;
     int seekable;
     int eof;
@@ -74,6 +119,8 @@ typedef struct {
     unsigned auto_convert;
     int segment_time_metadata;
 } ConcatContext;
+
+#define CONCAT_TRY_SELF_INTERVAL_US (3 * 1000 * 1000)
 
 static int concat_probe(const AVProbeData *probe)
 {
@@ -333,6 +380,625 @@ static int64_t get_best_effort_duration(ConcatFile *file, AVFormatContext *avf)
     return AV_NOPTS_VALUE;
 }
 
+static int url_is_local_ffconcat_script(const char *url)
+{
+    return url && access(url, F_OK) == 0;
+}
+
+static int concat_apply_src(AVFormatContext *ctx, const char *url)
+{
+    ConcatContext *cat = ctx->priv_data;
+    char *dup;
+
+    if (!url || !url[0])
+        return AVERROR(EINVAL);
+    dup = av_strdup(url);
+    if (!dup)
+        return AVERROR(ENOMEM);
+    av_freep(&cat->try_url);
+    cat->try_url = dup;
+    cat->waiting = 1;
+    av_log(ctx, AV_LOG_WARNING, "concat: src='%s'\n", url);
+    return 0;
+}
+
+static int concat_iformat_process_command(AVFormatContext *s, const char *cmd,
+                                          const char *arg, char *res, int res_len,
+                                          int flags)
+{
+    int ret;
+
+    (void)flags;
+    if (res && res_len > 0)
+        res[0] = 0;
+    if (!cmd || !cmd[0])
+        return AVERROR(EINVAL);
+    if (!strcmp(cmd, "src")) {
+        ret = concat_apply_src(s, arg);
+        if (ret >= 0 && res && res_len > 0)
+            av_strlcpy(res, "200", res_len);
+        return ret;
+    }
+    return AVERROR(ENOSYS);
+}
+
+#if CONFIG_LIBZMQ
+static void zmq_free_context(void **pctx)
+{
+    if (pctx && *pctx) {
+        zmq_ctx_term(*pctx);
+        *pctx = NULL;
+    }
+}
+
+static void *zmq_init_context(void)
+{
+    void *ctx = zmq_ctx_new();
+    if (!ctx)
+        return NULL;
+    return ctx;
+}
+
+static void zmq_close_socket(void **psock)
+{
+    if (psock && *psock) {
+        zmq_close(*psock);
+        *psock = NULL;
+    }
+}
+
+static void *zmq_open_socket(void *ctx, int type, const char *zurl)
+{
+    void *sock;
+    int linger = 0;
+    int ret;
+
+    sock = zmq_socket(ctx, type);
+    if (!sock)
+        return NULL;
+
+    ret = zmq_setsockopt(sock, ZMQ_LINGER, &linger, sizeof(linger));
+    if (ret != 0) {
+        zmq_close_socket(&sock);
+        return NULL;
+    }
+
+    if (zmq_bind(sock, zurl) != 0) {
+        zmq_close_socket(&sock);
+        return NULL;
+    }
+
+    return sock;
+}
+
+typedef struct {
+    char *target, *command, *arg;
+} ConcatCommand;
+
+#define CONCAT_CMD_SPACES " \f\t\n\r"
+
+static int parse_concat_command(ConcatCommand *cmd, const char *command_str, void *log_ctx)
+{
+    const char **buf = &command_str;
+
+    cmd->target = av_get_token(buf, CONCAT_CMD_SPACES);
+    if (!cmd->target || !cmd->target[0]) {
+        av_log(log_ctx, AV_LOG_ERROR,
+               "No target specified in command '%s'\n", command_str);
+        return AVERROR(EINVAL);
+    }
+
+    cmd->command = av_get_token(buf, CONCAT_CMD_SPACES);
+    if (!cmd->command || !cmd->command[0]) {
+        av_log(log_ctx, AV_LOG_ERROR,
+               "No command specified in command '%s'\n", command_str);
+        return AVERROR(EINVAL);
+    }
+
+    cmd->arg = av_get_token(buf, CONCAT_CMD_SPACES);
+    return 0;
+}
+
+static int concat_recv_command(AVFormatContext *ctx, char **buf, int *buf_size)
+{
+    ConcatContext *cat = ctx->priv_data;
+    ConcatZmqContext *zmq = cat->zmq_ctx;
+    zmq_msg_t msg;
+    int ret = 0;
+
+    if (!zmq)
+        return AVERROR(EINVAL);
+
+    if (zmq_msg_init(&msg) == -1) {
+        av_log(ctx, AV_LOG_WARNING,
+               "Could not initialize receive message: %s\n", zmq_strerror(zmq_errno()));
+        return AVERROR_EXTERNAL;
+    }
+
+    if (zmq_msg_recv(&msg, zmq->sock, ZMQ_DONTWAIT) == -1) {
+        if (zmq_errno() != EAGAIN) {
+            ret = AVERROR_EXTERNAL;
+            av_log(ctx, AV_LOG_WARNING,
+                   "Could not receive message: %s\n", zmq_strerror(zmq_errno()));
+        } else {
+            ret = AVERROR(EAGAIN);
+        }
+        goto end;
+    }
+
+    *buf_size = zmq_msg_size(&msg) + 1;
+    *buf = av_malloc(*buf_size);
+    if (!*buf) {
+        ret = AVERROR(ENOMEM);
+        goto end;
+    }
+    memcpy(*buf, zmq_msg_data(&msg), zmq_msg_size(&msg));
+    (*buf)[zmq_msg_size(&msg)] = 0;
+
+    zmq->command_count++;
+    av_log(ctx, AV_LOG_INFO, "concat cmd #%d: %s\n", zmq->command_count, *buf);
+
+end:
+    zmq_msg_close(&msg);
+    return ret;
+}
+
+static void concat_process_command(AVFormatContext *ctx)
+{
+    ConcatContext *cat = ctx->priv_data;
+    char *recv_buf = NULL, *send_buf = NULL;
+    int recv_buf_size = 0;
+    ConcatCommand cmd = { 0 };
+
+    if (!cat->zmq_ctx)
+        return;
+
+    if (concat_recv_command(ctx, &recv_buf, &recv_buf_size) < 0)
+        return;
+
+    do {
+        if (parse_concat_command(&cmd, recv_buf, ctx) == 0) {
+            if (strcmp(cmd.target, "concat")) {
+                send_buf = av_asprintf("400 concat: invalid target #%s", cmd.target);
+                break;
+            }
+            if (strcmp(cmd.command, "src")) {
+                send_buf = av_asprintf("400 concat: invalid command #%s", cmd.command);
+                break;
+            }
+            if (!cmd.arg || !cmd.arg[0]) {
+                send_buf = av_asprintf("400 concat: missing url argument for src");
+                break;
+            }
+            if (concat_apply_src(ctx, cmd.arg) < 0) {
+                send_buf = av_asprintf("500 concat: out of memory");
+                break;
+            }
+            send_buf = av_asprintf("200");
+        }
+    } while (0);
+
+    if (!send_buf)
+        send_buf = av_asprintf("400 concat: invalid cmd format: %s", recv_buf);
+
+    if (zmq_send(cat->zmq_ctx->sock, send_buf, strlen(send_buf), 0) == -1)
+        av_log(ctx, AV_LOG_ERROR, "Failed to send concat cmd reply: %s\n",
+               zmq_strerror(zmq_errno()));
+
+    av_freep(&send_buf);
+    av_freep(&recv_buf);
+    av_freep(&cmd.target);
+    av_freep(&cmd.command);
+    av_freep(&cmd.arg);
+}
+
+static ConcatZmqContext *concat_zmq_create(const char *zmq_url)
+{
+    ConcatZmqContext *zmq = av_mallocz(sizeof(*zmq));
+    if (!zmq)
+        return NULL;
+
+    zmq->ctx = zmq_init_context();
+    if (!zmq->ctx)
+        goto fail;
+
+    zmq->sock = zmq_open_socket(zmq->ctx, ZMQ_REP, zmq_url);
+    if (!zmq->sock)
+        goto fail;
+
+    zmq->url = av_strdup(zmq_url);
+    if (!zmq->url)
+        goto fail;
+
+    return zmq;
+
+fail:
+    zmq_close_socket(&zmq->sock);
+    zmq_free_context(&zmq->ctx);
+    av_freep(&zmq->url);
+    av_free(zmq);
+    return NULL;
+}
+
+static void concat_zmq_destroy(ConcatZmqContext **pzmq)
+{
+    ConcatZmqContext *zmq;
+
+    if (!pzmq || !*pzmq)
+        return;
+
+    zmq = *pzmq;
+    av_freep(&zmq->url);
+    zmq_close_socket(&zmq->sock);
+    zmq_free_context(&zmq->ctx);
+    av_free(zmq);
+    *pzmq = NULL;
+}
+#else
+static void concat_process_command(AVFormatContext *ctx)
+{
+}
+#endif
+
+static int try_detect_stream_specific(AVFormatContext *avf, int idx)
+{
+    ConcatContext *cat = avf->priv_data;
+    AVStream *st = cat->try_avf->streams[idx];
+    ConcatStream *cs = &cat->try_file->streams[idx];
+    const AVBitStreamFilter *filter;
+    AVBSFContext *bsf;
+    int ret;
+
+    if (cat->auto_convert && st->codecpar->codec_id == AV_CODEC_ID_H264) {
+        if (!st->codecpar->extradata_size                                                ||
+            (st->codecpar->extradata_size >= 3 && AV_RB24(st->codecpar->extradata) == 1) ||
+            (st->codecpar->extradata_size >= 4 && AV_RB32(st->codecpar->extradata) == 1))
+            return 0;
+        av_log(cat->try_avf, AV_LOG_INFO,
+               "Auto-inserting h264_mp4toannexb bitstream filter\n");
+        filter = av_bsf_get_by_name("h264_mp4toannexb");
+        if (!filter) {
+            av_log(avf, AV_LOG_ERROR, "h264_mp4toannexb bitstream filter "
+                   "required for H.264 streams\n");
+            return AVERROR_BSF_NOT_FOUND;
+        }
+        ret = av_bsf_alloc(filter, &bsf);
+        if (ret < 0)
+            return ret;
+        cs->bsf = bsf;
+
+        ret = avcodec_parameters_copy(bsf->par_in, st->codecpar);
+        if (ret < 0)
+           return ret;
+
+        ret = av_bsf_init(bsf);
+        if (ret < 0)
+            return ret;
+
+        ret = avcodec_parameters_copy(st->codecpar, bsf->par_out);
+        if (ret < 0)
+            return ret;
+    }
+    return 0;
+}
+
+static int try_match_streams_one_to_one(AVFormatContext *avf)
+{
+    ConcatContext *cat = avf->priv_data;
+    AVStream *st;
+    int i, ret;
+
+    for (i = cat->try_file->nb_streams; i < cat->try_avf->nb_streams; i++) {
+        if (i < avf->nb_streams) {
+            st = avf->streams[i];
+        } else {
+            if (!(st = avformat_new_stream(avf, NULL)))
+                return AVERROR(ENOMEM);
+        }
+        if ((ret = copy_stream_props(st, cat->try_avf->streams[i])) < 0)
+            return ret;
+        cat->try_file->streams[i].out_stream_index = i;
+    }
+    return 0;
+}
+
+static int try_match_streams_exact_id(AVFormatContext *avf)
+{
+    ConcatContext *cat = avf->priv_data;
+    AVStream *st;
+    int i, j, ret;
+
+    for (i = cat->try_file->nb_streams; i < cat->try_avf->nb_streams; i++) {
+        st = cat->try_avf->streams[i];
+        for (j = 0; j < avf->nb_streams; j++) {
+            if (avf->streams[j]->id == st->id) {
+                av_log(avf, AV_LOG_VERBOSE,
+                       "Match slave stream #%d with stream #%d id 0x%x\n",
+                       i, j, st->id);
+                if ((ret = copy_stream_props(avf->streams[j], st)) < 0)
+                    return ret;
+                cat->try_file->streams[i].out_stream_index = j;
+            }
+        }
+    }
+    return 0;
+}
+
+static int try_match_streams(AVFormatContext *avf)
+{
+    ConcatContext *cat = avf->priv_data;
+    ConcatStream *map;
+    int i, ret;
+
+    if (cat->try_file->nb_streams >= cat->try_avf->nb_streams)
+        return 0;
+    map = av_realloc(cat->try_file->streams,
+                     cat->try_avf->nb_streams * sizeof(*map));
+    if (!map)
+        return AVERROR(ENOMEM);
+    cat->try_file->streams = map;
+    memset(map + cat->try_file->nb_streams, 0,
+           (cat->try_avf->nb_streams - cat->try_file->nb_streams) * sizeof(*map));
+
+    for (i = cat->try_file->nb_streams; i < cat->try_avf->nb_streams; i++) {
+        map[i].out_stream_index = -1;
+        if ((ret = try_detect_stream_specific(avf, i)) < 0)
+            return ret;
+    }
+    switch (cat->stream_match_mode) {
+    case MATCH_ONE_TO_ONE:
+        ret = try_match_streams_one_to_one(avf);
+        break;
+    case MATCH_EXACT_ID:
+        ret = try_match_streams_exact_id(avf);
+        break;
+    default:
+        ret = AVERROR_BUG;
+    }
+    if (ret < 0)
+        return ret;
+    cat->try_file->nb_streams = cat->try_avf->nb_streams;
+    return 0;
+}
+
+static int try_validate_streams(AVFormatContext *avf)
+{
+    ConcatContext *cat = avf->priv_data;
+    int i;
+
+    if (!cat->avf || !cat->try_avf)
+        return AVERROR(EINVAL);
+
+    if (cat->try_avf->nb_streams != cat->avf->nb_streams)
+        return AVERROR(EINVAL);
+
+    for (i = 0; i < cat->try_avf->nb_streams; i++) {
+        AVStream *src = cat->try_avf->streams[i];
+        int out_idx = cat->try_file->streams[i].out_stream_index;
+        AVCodecParameters *curpar;
+
+        if (out_idx < 0)
+            return AVERROR(EINVAL);
+
+        curpar = cat->avf->streams[out_idx]->codecpar;
+        if (src->codecpar->codec_type != curpar->codec_type ||
+            src->codecpar->codec_id   != curpar->codec_id)
+            return AVERROR(EINVAL);
+    }
+
+    return 0;
+}
+
+static int try_open_file(AVFormatContext *avf, ConcatFile *file)
+{
+    ConcatContext *cat = avf->priv_data;
+    AVDictionary *options = NULL;
+    int ret;
+
+    if (cat->try_avf)
+        avformat_close_input(&cat->try_avf);
+
+    cat->try_avf = avformat_alloc_context();
+    if (!cat->try_avf)
+        return AVERROR(ENOMEM);
+
+    cat->try_avf->flags |= avf->flags & ~AVFMT_FLAG_CUSTOM_IO;
+    cat->try_avf->interrupt_callback = avf->interrupt_callback;
+
+    if ((ret = ff_copy_whiteblacklists(cat->try_avf, avf)) < 0)
+        return ret;
+
+    if ((ret = avformat_open_input(&cat->try_avf, file->url, NULL, &options)) < 0 ||
+        (ret = avformat_find_stream_info(cat->try_avf, NULL)) < 0) {
+        av_log(avf, AV_LOG_ERROR, "try open '%s' failed: %s\n",
+               file->url, av_err2str(ret));
+        av_dict_free(&options);
+        avformat_close_input(&cat->try_avf);
+        return ret;
+    }
+    av_dict_free(&options);
+
+    cat->try_file = file;
+    file->start_time    = AV_NOPTS_VALUE;
+    file->duration      = AV_NOPTS_VALUE;
+    file->user_duration = AV_NOPTS_VALUE;
+    file->next_dts      = AV_NOPTS_VALUE;
+    file->inpoint       = AV_NOPTS_VALUE;
+    file->outpoint      = AV_NOPTS_VALUE;
+    file->file_start_time = (cat->try_avf->start_time == AV_NOPTS_VALUE) ? 0 : cat->try_avf->start_time;
+    file->file_inpoint = (file->inpoint == AV_NOPTS_VALUE) ? file->file_start_time : file->inpoint;
+    file->duration = get_best_effort_duration(file, cat->try_avf);
+
+    if (cat->segment_time_metadata) {
+        av_dict_set_int(&file->metadata, "lavf.concatdec.start_time", file->start_time, 0);
+        if (file->duration != AV_NOPTS_VALUE)
+            av_dict_set_int(&file->metadata, "lavf.concatdec.duration", file->duration, 0);
+    }
+
+    if ((ret = try_match_streams(avf)) < 0)
+        goto fail;
+    if ((ret = try_validate_streams(avf)) < 0) {
+        av_log(avf, AV_LOG_ERROR, "try open '%s' rejected: stream layout mismatch\n", file->url);
+        goto fail;
+    }
+    if (file->inpoint != AV_NOPTS_VALUE) {
+       if ((ret = avformat_seek_file(cat->try_avf, -1, INT64_MIN, file->inpoint, file->inpoint, 0)) < 0)
+           goto fail;
+    }
+
+    av_log(avf, AV_LOG_INFO, "try open '%s' success\n", file->url);
+    return 0;
+
+fail:
+    avformat_close_input(&cat->try_avf);
+    cat->try_file = NULL;
+    return ret;
+}
+
+static int try_open_next_file(AVFormatContext *avf, const char *url)
+{
+    ConcatFile *file;
+
+    file = av_mallocz(sizeof(*file));
+    if (!file)
+        return AVERROR(ENOMEM);
+
+    file->url = av_strdup(url);
+    if (!file->url) {
+        av_free(file);
+        return AVERROR(ENOMEM);
+    }
+
+    if (try_open_file(avf, file) < 0) {
+        av_freep(&file->url);
+        av_free(file);
+        return AVERROR(EIO);
+    }
+
+    return 0;
+}
+
+static void update_inputSrc(AVFormatContext *avf)
+{
+    ConcatContext *cat = avf->priv_data;
+    unsigned i, j;
+    ConcatFile *old_try_file = cat->try_file;
+
+    cat->cur_file->duration = get_best_effort_duration(cat->cur_file, cat->avf);
+    cat->try_file->start_time = cat->cur_file->start_time + cat->cur_file->duration;
+
+    for (i = 0; i < cat->nb_files; i++) {
+        av_freep(&cat->files[i].url);
+        for (j = 0; j < cat->files[i].nb_streams; j++) {
+            if (cat->files[i].streams[j].bsf)
+                av_bsf_free(&cat->files[i].streams[j].bsf);
+        }
+        av_freep(&cat->files[i].streams);
+        av_dict_free(&cat->files[i].metadata);
+        av_dict_free(&cat->files[i].options);
+    }
+
+    if (cat->avf)
+        avformat_close_input(&cat->avf);
+
+    cat->avf = cat->try_avf;
+    cat->try_avf = NULL;
+    memcpy(&cat->files[0], cat->try_file, sizeof(*cat->try_file));
+    cat->cur_file = &cat->files[0];
+    cat->nb_files = 1;
+
+    if (old_try_file && old_try_file != &cat->files[0])
+        av_free(old_try_file);
+
+    cat->try_file = &cat->files[0];
+    cat->try_stage = 0;
+    cat->waiting = 0;
+}
+
+static void concat_enter_recovery(ConcatContext *cat)
+{
+    if (!cat->cur_file || !cat->cur_file->url)
+        return;
+
+    av_freep(&cat->try_url);
+    cat->try_url = av_strdup(cat->cur_file->url);
+    cat->waiting = 1;
+}
+
+#if HAVE_PTHREADS
+static void *concat_monitor_worker(void *arg)
+{
+    AVFormatContext *avf = arg;
+    ConcatContext *cat = avf->priv_data;
+    int32_t time_us = 10 * 1000;
+    int ret;
+
+    /* Intentionally NOT pthread_detach()'d: concat_read_close() joins this
+     * thread after setting cat->eof, so we never touch freed ConcatContext
+     * memory after the demuxer is closed (a detached thread could still be
+     * inside try_open_next_file()/av_usleep() when priv_data is freed). */
+
+    while (!cat->eof) {
+        if (cat->try_stage == 1 || !cat->try_url) {
+            av_usleep(10 * 1000);
+            continue;
+        }
+
+        /* Same URL: only probe when try_self recovery is armed (waiting).
+         * Different URL: always allow hot-switch probe. */
+        if (cat->cur_file && cat->cur_file->url &&
+            !strcmp(cat->cur_file->url, cat->try_url)) {
+            if (!cat->try_self || !cat->waiting) {
+                av_usleep(10 * 1000);
+                continue;
+            }
+        }
+
+        ret = try_open_next_file(avf, cat->try_url);
+        if (ret == 0) {
+            cat->try_stage = 1;
+            time_us = 10 * 1000;
+        } else {
+            av_log(avf, AV_LOG_WARNING,
+                   "try open '%s' failed, keep current source '%s'\n",
+                   cat->try_url,
+                   cat->cur_file ? cat->cur_file->url : "none");
+            time_us = cat->try_self ? CONCAT_TRY_SELF_INTERVAL_US :
+                       FFMIN(time_us * 2, 10 * 1000 * 1000);
+        }
+
+        av_usleep(time_us);
+    }
+
+    return NULL;
+}
+#endif
+
+static int concat_start_monitor(AVFormatContext *avf)
+{
+    ConcatContext *cat = avf->priv_data;
+#if HAVE_PTHREADS
+    int ret;
+
+    if ((ret = pthread_create(&cat->thread, NULL, concat_monitor_worker, avf))) {
+        av_log(avf, AV_LOG_ERROR, "pthread_create failed: %s\n", strerror(ret));
+        return AVERROR(ret);
+    }
+    cat->thread_started = 1;
+#else
+    av_log(avf, AV_LOG_WARNING,
+           "pthreads unavailable, concat bypass probing disabled\n");
+#endif
+
+#if CONFIG_LIBZMQ
+    cat->zmq_ctx = NULL;
+    if (cat->zmq_url && strcmp("ipc://cmd_xxxx.sock", cat->zmq_url))
+        cat->zmq_ctx = concat_zmq_create(cat->zmq_url);
+#endif
+
+    return 0;
+}
+
 static int open_file(AVFormatContext *avf, unsigned fileno)
 {
     ConcatContext *cat = avf->priv_data;
@@ -397,6 +1063,19 @@ static int concat_read_close(AVFormatContext *avf)
     ConcatContext *cat = avf->priv_data;
     unsigned i, j;
 
+    cat->eof = 1;
+
+#if HAVE_PTHREADS
+    /* Wait for the monitor thread to observe cat->eof and exit before we
+     * free anything below: the thread reads/writes cat->try_url, cat->avf,
+     * cat->cur_file, cat->try_stage, etc., so it must not be left running
+     * (or merely detached) once this ConcatContext is torn down. */
+    if (cat->thread_started) {
+        pthread_join(cat->thread, NULL);
+        cat->thread_started = 0;
+    }
+#endif
+
     for (i = 0; i < cat->nb_files; i++) {
         av_freep(&cat->files[i].url);
         for (j = 0; j < cat->files[i].nb_streams; j++) {
@@ -407,9 +1086,17 @@ static int concat_read_close(AVFormatContext *avf)
         av_dict_free(&cat->files[i].metadata);
         av_dict_free(&cat->files[i].options);
     }
+    if (cat->try_avf)
+        avformat_close_input(&cat->try_avf);
+    if (cat->try_file && cat->files && cat->try_file != &cat->files[0])
+        av_free(cat->try_file);
     if (cat->avf)
         avformat_close_input(&cat->avf);
     av_freep(&cat->files);
+    av_freep(&cat->try_url);
+#if CONFIG_LIBZMQ
+    concat_zmq_destroy(&cat->zmq_ctx);
+#endif
     return 0;
 }
 
@@ -663,11 +1350,32 @@ static int concat_read_header(AVFormatContext *avf)
     ConcatContext *cat = avf->priv_data;
     int64_t time = 0;
     unsigned i;
+    unsigned nb_files_alloc = 0;
+    ConcatFile *file = NULL;
+    int direct_url = 0;
     int ret;
 
-    ret = concat_parse_script(avf);
-    if (ret < 0)
-        return ret;
+    if (url_is_local_ffconcat_script(avf->url)) {
+        ret = concat_parse_script(avf);
+        if (ret < 0)
+            return ret;
+    } else {
+        char *filename;
+
+        direct_url = 1;
+        cat->safe = 0;
+        av_log(avf, AV_LOG_INFO,
+               "concat direct url '%s', safe=0\n", avf->url);
+
+        filename = av_strdup(avf->url);
+        if (!filename)
+            return AVERROR(ENOMEM);
+
+        ret = add_file(avf, filename, &file, &nb_files_alloc);
+        if (ret < 0)
+            return ret;
+    }
+
     if (!cat->nb_files) {
         av_log(avf, AV_LOG_ERROR, "No files to concat\n");
         return AVERROR_INVALIDDATA;
@@ -700,6 +1408,12 @@ static int concat_read_header(AVFormatContext *avf)
     if ((ret = open_file(avf, 0)) < 0)
         return ret;
 
+    if (direct_url || cat->try_self) {
+        ret = concat_start_monitor(avf);
+        if (ret < 0)
+            return ret;
+    }
+
     return 0;
 }
 
@@ -711,6 +1425,10 @@ static int open_next_file(AVFormatContext *avf)
     cat->cur_file->duration = get_best_effort_duration(cat->cur_file, cat->avf);
 
     if (++fileno >= cat->nb_files) {
+        if (cat->try_self) {
+            concat_enter_recovery(cat);
+            return AVERROR(EAGAIN);
+        }
         cat->eof = 1;
         return AVERROR_EOF;
     }
@@ -763,25 +1481,82 @@ static int concat_read_packet(AVFormatContext *avf, AVPacket *pkt)
     if (cat->eof)
         return AVERROR_EOF;
 
-    if (!cat->avf)
+    concat_process_command(avf);
+
+    if (cat->try_stage == 1)
+        update_inputSrc(avf);
+
+    /* No active source yet (or closed during recovery): wait for bypass probe.
+     * Block briefly instead of returning EAGAIN immediately so that callers
+     * which retry read_packet in a tight loop don't busy-spin at 100% CPU
+     * while the monitor thread is probing in the background (it retries
+     * every 3s for try_self, or as soon as a hot-switch probe succeeds). */
+    if (!cat->avf) {
+        if (cat->try_self || cat->waiting) {
+            concat_enter_recovery(cat);
+            av_usleep(10 * 1000);
+            return AVERROR(EAGAIN);
+        }
         return AVERROR(EIO);
+    }
+
+    /* NOTE: we deliberately do NOT block packet delivery just because
+     * cat->waiting is set. "waiting" only arms the monitor thread to
+     * (re)probe a URL (possibly the same one, for try_self); the current
+     * source in cat->avf, if still open, is assumed healthy and playback
+     * must keep flowing uninterrupted until the background probe
+     * succeeds (try_stage == 1) or the source itself fails below. This
+     * is what makes the hot-switch non-disruptive. */
 
     while (1) {
+        if (cat->try_stage == 1) {
+            update_inputSrc(avf);
+            av_log(avf, AV_LOG_INFO, "concat switch success\n");
+            if (!cat->avf)
+                return AVERROR(EAGAIN);
+        }
+
         ret = av_read_frame(cat->avf, pkt);
         if (ret == AVERROR_EOF) {
-            if ((ret = open_next_file(avf)) < 0)
+            if ((ret = open_next_file(avf)) < 0) {
+                if (ret == AVERROR(EAGAIN))
+                    return ret;
+                if (cat->try_self) {
+                    if (cat->avf)
+                        avformat_close_input(&cat->avf);
+                    concat_enter_recovery(cat);
+                    return AVERROR(EAGAIN);
+                }
                 return ret;
+            }
             continue;
         }
-        if (ret < 0)
+        if (ret < 0) {
+            if (cat->try_self) {
+                if (cat->avf)
+                    avformat_close_input(&cat->avf);
+                concat_enter_recovery(cat);
+                return AVERROR(EAGAIN);
+            }
             return ret;
+        }
+
+        cat->waiting = 0;
+
         if ((ret = match_streams(avf)) < 0) {
             return ret;
         }
         if (packet_after_outpoint(cat, pkt)) {
             av_packet_unref(pkt);
-            if ((ret = open_next_file(avf)) < 0)
+            if ((ret = open_next_file(avf)) < 0) {
+                if (ret == AVERROR(EAGAIN))
+                    return ret;
+                if (cat->try_self) {
+                    concat_enter_recovery(cat);
+                    return AVERROR(EAGAIN);
+                }
                 return ret;
+            }
             continue;
         }
         cs = &cat->cur_file->streams[pkt->stream_index];
@@ -940,6 +1715,10 @@ static const AVOption options[] = {
       OFFSET(auto_convert), AV_OPT_TYPE_BOOL, {.i64 = 1}, 0, 1, DEC },
     { "segment_time_metadata", "output file segment start time and duration as packet metadata",
       OFFSET(segment_time_metadata), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, DEC },
+    { "concat_cmd", "dynamic concat command socket (requires libzmq)",
+      OFFSET(zmq_url), AV_OPT_TYPE_STRING, {.str = "ipc://cmd_xxxx.sock"}, 0, 0, DEC },
+    { "try_self", "auto bypass reconnect to current url on read failure",
+      OFFSET(try_self), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, DEC },
     { NULL }
 };
 
@@ -962,4 +1741,5 @@ const FFInputFormat ff_concat_demuxer = {
     .read_packet    = concat_read_packet,
     .read_close     = concat_read_close,
     .read_seek2     = concat_seek,
+    .process_command = concat_iformat_process_command,
 };

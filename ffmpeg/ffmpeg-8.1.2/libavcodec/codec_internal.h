@@ -285,6 +285,13 @@ typedef struct FFCodec {
                                 unsigned flags,
                                 const void **out_configs,
                                 int *out_num_configs);
+
+    /**
+     * Optional runtime command handler (same idea as AVFilter.process_command).
+     * Absent / NULL means this codec does not accept ZMQ/CLI commands.
+     */
+    int (*process_command)(struct AVCodecContext *avctx, const char *cmd,
+                           const char *arg, char *res, int res_len, int flags);
 } FFCodec;
 
 static av_always_inline const FFCodec *ffcodec(const AVCodec *codec)

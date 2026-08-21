@@ -19,6 +19,7 @@
 #
 # 用法:
 #   ./build.sh [linux64] [nonfree] [8.1.2]
+#   PATH="/data/sunpf/ffmpeg-builds/build/tools/bin:$PATH" make -j"$(nproc)"
 #
 # 环境变量:
 #   REUSE=1              默认：复用已有依赖，不重下不重编已完成 stage

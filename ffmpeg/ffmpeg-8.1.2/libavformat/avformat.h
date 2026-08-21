@@ -2464,6 +2464,13 @@ int avformat_send_command(AVFormatContext *s, enum AVFormatCommandID id, void *d
 int avformat_receive_command_reply(AVFormatContext *s, enum AVFormatCommandID id, void **data_out);
 
 /**
+ * Send a runtime string command to a muxer or demuxer.
+ * Formats without process_command return AVERROR(ENOSYS).
+ */
+int avformat_process_command(AVFormatContext *s, const char *cmd, const char *arg,
+                             char *res, int res_len, int flags);
+
+/**
  * Close an opened input AVFormatContext. Free it and all its contents
  * and set *s to NULL.
  */

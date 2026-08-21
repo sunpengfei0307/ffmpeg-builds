@@ -888,3 +888,18 @@ int av_packet_side_data_to_frame(AVFrameSideData ***psd, int *pnb_sd,
 
     return 0;
 }
+
+int avcodec_process_command(AVCodecContext *avctx, const char *cmd, const char *arg,
+                            char *res, int res_len, int flags)
+{
+    const FFCodec *codec;
+
+    if (res && res_len > 0)
+        res[0] = 0;
+    if (!avctx || !avctx->codec || !cmd || !cmd[0])
+        return AVERROR(EINVAL);
+    codec = ffcodec(avctx->codec);
+    if (!codec->process_command)
+        return AVERROR(ENOSYS);
+    return codec->process_command(avctx, cmd, arg, res, res_len, flags);
+}

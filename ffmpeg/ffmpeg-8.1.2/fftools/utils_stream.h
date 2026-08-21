@@ -558,7 +558,7 @@ static void put_leb128(PutBitContext *pb, uint32_t value) {
 // OBU = [obu-header + obu-size(leb) + obu-payload]. obu-payload-
 // metadata_obu = metadata_type <public:[0,1-5,32+], private:[6-31]>
 // eg. uchar data[] = { 0x2A, 0x04, 0x06, 0x02, 0x03, 0x04};
-static void put_obu_metadata(PutBitContext *pb, bool isAnnexb, uint8_t *payload, size_t payload_size) {
+static void put_obu_metadata(PutBitContext *pb, bool isAnnexb, const uint8_t *payload, size_t payload_size) {
 	if (isAnnexb) {
 		av_log(NULL, AV_LOG_DEBUG, "Hi! we just ignore av1 isAnnexb's format currently!");
 	}
@@ -603,7 +603,7 @@ build_av1_obu_metadata(bool isAnnexb, unsigned char* nalu_data_out, uint32_t nal
     PutBitContext pb;
     init_put_bits(&pb, nalu_data_out, nalu_data_out_size);
 	// Create OBU metadata bitstream, OBU Size=Payload size
-    put_obu_metadata(&pb, isAnnexb,  content, content_size);
+    put_obu_metadata(&pb, isAnnexb, (const uint8_t *)content, content_size);
 	align_put_bits(&pb);
     flush_put_bits(&pb);	
 	int32_t real_bits = put_bits_count(&pb);
@@ -729,7 +729,7 @@ hw_frames_ref(AVBufferRef *device_ctx, enum AVPixelFormat format, int width, int
 	int32_t ret = -1;
 	out_ref = av_hwframe_ctx_alloc(device_ctx);
 	if (!out_ref)
-		return AVERROR(ENOMEM);
+		return NULL;
 	out_ctx = (AVHWFramesContext*)out_ref->data;
 	out_ctx->format    = AV_PIX_FMT_CUDA;
 	out_ctx->sw_format = format;
@@ -892,7 +892,6 @@ fail:
 // eg. rescale cuda.
 static AVFrame* 
 fg_scaled_cuda(AVFilterGraphWrap **p_wrap, AVRational src_tb, AVFrame *src, int32_t dst_fmt, int32_t dst_width, int32_t dst_height) {
-	int ret = -1;
 	if (AV_PIX_FMT_CUDA != src->format || NULL == src->hw_frames_ctx) {
 		av_log(NULL, AV_LOG_ERROR, "Unsupport GPU format=%s or src->hw_frames_ctx=NULL.\n", av_get_pix_fmt_name(src->format));
 		return NULL;

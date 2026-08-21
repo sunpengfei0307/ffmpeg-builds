@@ -824,6 +824,10 @@ extern int copy_unknown_streams;
 
 extern int recast_media;
 
+/* iqiyi compat / multi-input live */
+extern int skip_to_key;
+extern int use_ntp;
+
 extern FILE *vstats_file;
 
 void term_init(void);
@@ -1009,5 +1013,19 @@ int view_specifier_parse(const char **pspec, ViewSpecifier *vs);
 
 int muxer_thread(void *arg);
 int encoder_thread(void *arg);
+
+/* process-level ZMQ (does not replace graph zmq/azmq) */
+extern char *ffmpeg_zmq_url;
+int  ffmpeg_zmq_init(const char *url);
+void ffmpeg_zmq_uninit(void);
+int  ffmpeg_zmq_dispatch(const char *line, char *res, int res_len);
+int  ffmpeg_process_command(const char *cmd, const char *arg, char *res, int res_len);
+void ffmpeg_request_quit(void);
+int  dec_process_command(InputStream *ist, const char *cmd, const char *arg,
+                         char *res, int res_len, int flags);
+int  of_process_command(OutputFile *of, const char *cmd, const char *arg,
+                        char *res, int res_len, int flags);
+int  of_proto_process_command(OutputFile *of, const char *cmd, const char *arg,
+                              char *res, int res_len, int flags);
 
 #endif /* FFTOOLS_FFMPEG_H */

@@ -38,6 +38,7 @@
 #include "libavcodec/packet.h"
 
 #include "libavformat/avformat.h"
+#include "libavformat/url.h"
 #include "libavformat/avio.h"
 
 typedef struct MuxThreadContext {
@@ -899,4 +900,27 @@ int64_t of_filesize(OutputFile *of)
 {
     Muxer *mux = mux_from_of(of);
     return atomic_load(&mux->last_filesize);
+}
+
+int of_process_command(OutputFile *of, const char *cmd, const char *arg,
+                       char *res, int res_len, int flags)
+{
+    Muxer *mux = mux_from_of(of);
+    if (!mux || !mux->fc)
+        return AVERROR(ENOSYS);
+    return avformat_process_command(mux->fc, cmd, arg, res, res_len, flags);
+}
+
+int of_proto_process_command(OutputFile *of, const char *cmd, const char *arg,
+                             char *res, int res_len, int flags)
+{
+    Muxer *mux = mux_from_of(of);
+    URLContext *h;
+
+    if (!mux || !mux->fc || !mux->fc->pb || (mux->fc->flags & AVFMT_FLAG_CUSTOM_IO))
+        return AVERROR(ENOSYS);
+    h = mux->fc->pb->opaque;
+    if (!h || !h->prot)
+        return AVERROR(ENOSYS);
+    return ffurl_process_command(h, cmd, arg, res, res_len, flags);
 }

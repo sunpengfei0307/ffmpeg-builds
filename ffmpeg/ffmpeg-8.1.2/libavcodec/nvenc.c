@@ -22,6 +22,10 @@
 #include "config.h"
 #include "config_components.h"
 
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+
 #include "nvenc.h"
 #include "hevc/sei.h"
 #if CONFIG_AV1_NVENC_ENCODER
@@ -34,6 +38,7 @@
 #include "libavutil/imgutils.h"
 #include "libavutil/mem.h"
 #include "libavutil/pixdesc.h"
+#include "libavutil/avstring.h"
 #include "libavutil/timecode_internal.h"
 #include "libavutil/mathematics.h"
 #include "libavutil/frame.h"
@@ -3688,4 +3693,62 @@ av_cold void ff_nvenc_encode_flush(AVCodecContext *avctx)
     av_fifo_reset2(ctx->timestamp_list);
     ctx->output_frame_num = 0;
     ctx->initial_delay_time = 0;
+}
+
+int ff_nvenc_process_command(AVCodecContext *avctx, const char *cmd, const char *arg,
+                             char *res, int res_len, int flags)
+{
+    NvencContext *x4 = avctx->priv_data;
+    char tmp[256];
+    int wrote = 0;
+
+    (void)flags;
+    if (res && res_len > 0)
+        res[0] = 0;
+    if (!cmd || !cmd[0])
+        return AVERROR(EINVAL);
+    if (!arg)
+        arg = "";
+
+    if (!strcmp(cmd, "bitrate") || !strcmp(cmd, "b")) {
+        int64_t br = strtoll(arg, NULL, 10);
+        if (br <= 0)
+            return AVERROR(EINVAL);
+        avctx->bit_rate = br;
+    } else if (!strcmp(cmd, "maxrate") || !strcmp(cmd, "maxrate:v")) {
+        int64_t mr = strtoll(arg, NULL, 10);
+        if (mr <= 0)
+            return AVERROR(EINVAL);
+        avctx->rc_max_rate = mr;
+    } else if (!strcmp(cmd, "bufsize") || !strcmp(cmd, "buf_size")) {
+        int bs = atoi(arg);
+        if (bs <= 0)
+            return AVERROR(EINVAL);
+        avctx->rc_buffer_size = bs;
+    } else if (!strcmp(cmd, "b_scale_ratio") || !strcmp(cmd, "vb_scale_ratio")) {
+        double s = atof(arg);
+        if (s <= 0.1)
+            return AVERROR(EINVAL);
+        x4->b_scale_ratio = s;
+    } else {
+        return AVERROR(ENOSYS);
+    }
+
+    if (avctx->bit_rate > 0 && x4->b_scale_ratio > 0.1 &&
+        (!strcmp(cmd, "bitrate") || !strcmp(cmd, "b") ||
+         !strcmp(cmd, "b_scale_ratio") || !strcmp(cmd, "vb_scale_ratio"))) {
+        avctx->rc_buffer_size = (int)(x4->b_scale_ratio * avctx->bit_rate);
+        avctx->rc_max_rate = (int64_t)((x4->b_scale_ratio - 0.1) * avctx->bit_rate);
+        if (avctx->rc_max_rate <= 0)
+            avctx->rc_max_rate = avctx->bit_rate;
+    }
+
+    wrote = snprintf(tmp, sizeof(tmp),
+                     "bitrate=%"PRId64" maxrate=%"PRId64" bufsize=%d b_scale_ratio=%g",
+                     avctx->bit_rate, avctx->rc_max_rate, avctx->rc_buffer_size,
+                     x4->b_scale_ratio);
+    if (res && res_len > 0 && wrote > 0)
+        av_strlcpy(res, tmp, res_len);
+    av_log(avctx, AV_LOG_WARNING, "nvenc cmd %s %s -> %s\n", cmd, arg, tmp);
+    return 0;
 }

@@ -94,6 +94,11 @@ typedef struct URLProtocol {
     int (*url_delete)(URLContext *h);
     int (*url_move)(URLContext *h_src, URLContext *h_dst);
     const char *default_whitelist;
+    /**
+     * Optional runtime command handler. NULL means this protocol ignores ZMQ commands.
+     */
+    int (*process_command)(URLContext *h, const char *cmd, const char *arg,
+                           char *res, int res_len, int flags);
 } URLProtocol;
 
 /**
@@ -337,6 +342,9 @@ int ff_make_absolute_url(char *buf, int size, const char *base,
  * @return entry or NULL on error
  */
 AVIODirEntry *ff_alloc_dir_entry(void);
+
+int ffurl_process_command(URLContext *h, const char *cmd, const char *arg,
+                          char *res, int res_len, int flags);
 
 const AVClass *ff_urlcontext_child_class_iterate(void **iter);
 

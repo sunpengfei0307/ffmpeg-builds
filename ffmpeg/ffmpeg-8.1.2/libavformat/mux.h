@@ -162,6 +162,12 @@ typedef struct FFOutputFormat {
      */
     int (*check_bitstream)(AVFormatContext *s, AVStream *st,
                            const AVPacket *pkt);
+
+    /**
+     * Optional runtime command handler. NULL means this muxer ignores ZMQ commands.
+     */
+    int (*process_command)(AVFormatContext *s, const char *cmd, const char *arg,
+                           char *res, int res_len, int flags);
 } FFOutputFormat;
 
 static inline const FFOutputFormat *ffofmt(const AVOutputFormat *fmt)

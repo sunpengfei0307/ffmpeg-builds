@@ -121,6 +121,7 @@ OBJS-$(CONFIG_ATILT_FILTER)                  += af_atilt.o
 OBJS-$(CONFIG_ATRIM_FILTER)                  += trim.o
 OBJS-$(CONFIG_AXCORRELATE_FILTER)            += af_axcorrelate.o
 OBJS-$(CONFIG_AZMQ_FILTER)                   += f_zmq.o
+OBJS-$(CONFIG_LIBZMQ)                        += lavfi_zeromq.o
 OBJS-$(CONFIG_BANDPASS_FILTER)               += af_biquads.o
 OBJS-$(CONFIG_BANDREJECT_FILTER)             += af_biquads.o
 OBJS-$(CONFIG_BASS_FILTER)                   += af_biquads.o
@@ -428,6 +429,10 @@ OBJS-$(CONFIG_OSCILLOSCOPE_FILTER)           += vf_datascope.o
 OBJS-$(CONFIG_OVERLAY_FILTER)                += vf_overlay.o framesync.o
 OBJS-$(CONFIG_OVERLAY_CUDA_FILTER)           += vf_overlay_cuda.o framesync.o vf_overlay_cuda.ptx.o \
                                                 cuda/load_helper.o
+OBJS-$(CONFIG_MIXING_CUDA_FILTER)            += vf_mixing_cuda.o vf_mixing_cuda_layout.o framesync.o vf_mixing_cuda.ptx.o \
+                                                cuda/load_helper.o
+OBJS-$(CONFIG_DYNAMIC_INPUT_FILTER)          += vf_dynamic_input.o
+OBJS-$(CONFIG_AMIXRANK_FILTER)               += af_amixrank.o
 OBJS-$(CONFIG_OVERLAY_OPENCL_FILTER)         += vf_overlay_opencl.o opencl.o \
                                                 opencl/overlay.o framesync.o
 OBJS-$(CONFIG_OVERLAY_QSV_FILTER)            += vf_overlay_qsv.o framesync.o
@@ -436,6 +441,8 @@ OBJS-$(CONFIG_OVERLAY_VULKAN_FILTER)         += vf_overlay_vulkan.o vulkan.o vul
 OBJS-$(CONFIG_OWDENOISE_FILTER)              += vf_owdenoise.o
 OBJS-$(CONFIG_PAD_FILTER)                    += vf_pad.o
 OBJS-$(CONFIG_PAD_CUDA_FILTER)               += vf_pad_cuda.o vf_pad_cuda.ptx.o cuda/load_helper.o
+OBJS-$(CONFIG_EQ_CUDA_FILTER)                += vf_eq_cuda.o vf_eq_cuda.ptx.o cuda/load_helper.o
+OBJS-$(CONFIG_CURVES_CUDA_FILTER)            += vf_curves_cuda.o vf_curves_cuda.ptx.o cuda/load_helper.o
 OBJS-$(CONFIG_PAD_OPENCL_FILTER)             += vf_pad_opencl.o opencl.o opencl/pad.o
 OBJS-$(CONFIG_PALETTEGEN_FILTER)             += vf_palettegen.o palette.o
 OBJS-$(CONFIG_PALETTEUSE_FILTER)             += vf_paletteuse.o framesync.o palette.o
@@ -617,6 +624,8 @@ OBJS-$(CONFIG_ALLRGB_FILTER)                 += vsrc_testsrc.o
 OBJS-$(CONFIG_ALLYUV_FILTER)                 += vsrc_testsrc.o
 OBJS-$(CONFIG_CELLAUTO_FILTER)               += vsrc_cellauto.o
 OBJS-$(CONFIG_COLOR_FILTER)                  += vsrc_testsrc.o
+OBJS-$(CONFIG_COLOR_CUDA_FILTER)             += vsrc_color_cuda.o vsrc_color_cuda.ptx.o \
+                                                cuda/load_helper.o
 OBJS-$(CONFIG_COLORCHART_FILTER)             += vsrc_testsrc.o
 OBJS-$(CONFIG_COLORSPECTRUM_FILTER)          += vsrc_testsrc.o
 OBJS-$(CONFIG_COREIMAGESRC_FILTER)           += vf_coreimage.o

@@ -49,6 +49,7 @@ static const enum AVPixelFormat supported_formats[] = {
     AV_PIX_FMT_YUVA420P,
     AV_PIX_FMT_YUVA444P,
     AV_PIX_FMT_NV12,
+    AV_PIX_FMT_P010,
 };
 
 typedef struct CUDAPadContext {
@@ -59,6 +60,8 @@ typedef struct CUDAPadContext {
     int w, h;       ///< output dimensions, a value of 0 will result in the input size
     int x, y;       ///< offsets of the input area with respect to the padded area
     int in_w, in_h; ///< width and height for the padded input video
+    int scaled_w, scaled_h; ///< fit-inside size when auto_scale=1 (else equals in_w/in_h)
+    int auto_scale; ///< 0: pad-only (out>=in); 1: scale-to-fit then pad
 
     char *w_expr;   ///< width expression
     char *h_expr;   ///< height expression
@@ -66,7 +69,11 @@ typedef struct CUDAPadContext {
     char *y_expr;   ///< y offset expression
 
     uint8_t rgba_color[4];    ///< color for the padding area
-    uint8_t parsed_color[4];
+    /**
+     * Per-plane fill values. 8-bit formats store 0..255;
+     * P010 stores left-aligned 10-bit (value << 6).
+     */
+    uint16_t fill[4];
     AVRational aspect;
 
     int eval_mode;
@@ -77,6 +84,12 @@ typedef struct CUDAPadContext {
     CUmodule cu_module;
     CUfunction cu_func_uchar;
     CUfunction cu_func_uchar2;
+    CUfunction cu_func_ushort;
+    CUfunction cu_func_ushort2;
+    CUfunction cu_func_scale_uchar;
+    CUfunction cu_func_scale_uchar2;
+    CUfunction cu_func_scale_ushort;
+    CUfunction cu_func_scale_ushort2;
 } CUDAPadContext;
 
 static const char *const var_names[] = {
@@ -123,11 +136,20 @@ static int eval_expr(AVFilterContext *ctx)
 {
     CUDAPadContext *s = ctx->priv;
     AVFilterLink *inlink = ctx->inputs[0];
+    FilterLink *inl = ff_filter_link(inlink);
     const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(inlink->format);
 
     double var_values[VARS_NB], res;
     char *expr;
     int ret;
+
+    /* Prefer software format chroma (CUDA link format has no useful subsampling). */
+    if (inl->hw_frames_ctx) {
+        AVHWFramesContext *hwfc = (AVHWFramesContext *)inl->hw_frames_ctx->data;
+        const AVPixFmtDescriptor *swdesc = av_pix_fmt_desc_get(hwfc->sw_format);
+        if (swdesc)
+            desc = swdesc;
+    }
 
     var_values[VAR_IN_W]   = var_values[VAR_IW]   = s->in_w;
     var_values[VAR_IN_H]   = var_values[VAR_IH]   = s->in_h;
@@ -190,6 +212,32 @@ static int eval_expr(AVFilterContext *ctx)
 
     var_values[VAR_OUT_W] = var_values[VAR_OW] = s->w;
 
+    /* Fit-inside scale so x/y expressions can center with (ow-iw)/2 */
+    if (s->auto_scale) {
+        const int hmask = (1 << desc->log2_chroma_w) - 1;
+        const int vmask = (1 << desc->log2_chroma_h) - 1;
+        double scale = FFMIN((double)s->w / s->in_w, (double)s->h / s->in_h);
+        int scaled_w = (int)(s->in_w * scale + 0.5);
+        int scaled_h = (int)(s->in_h * scale + 0.5);
+
+        scaled_w = FFMAX(scaled_w & ~hmask, hmask ? (hmask + 1) : 1);
+        scaled_h = FFMAX(scaled_h & ~vmask, vmask ? (vmask + 1) : 1);
+        if (scaled_w > s->w)
+            scaled_w = s->w & ~hmask;
+        if (scaled_h > s->h)
+            scaled_h = s->h & ~vmask;
+        scaled_w = FFMAX(scaled_w, hmask ? (hmask + 1) : 1);
+        scaled_h = FFMAX(scaled_h, vmask ? (vmask + 1) : 1);
+
+        s->scaled_w = scaled_w;
+        s->scaled_h = scaled_h;
+
+        var_values[VAR_IN_W] = var_values[VAR_IW] = s->scaled_w;
+        var_values[VAR_IN_H] = var_values[VAR_IH] = s->scaled_h;
+    } else {
+        s->scaled_w = s->in_w;
+        s->scaled_h = s->in_h;
+    }
 
     expr = s->x_expr;
     ret = av_expr_parse_and_eval(&res, expr, var_names, var_values, NULL, NULL, NULL, NULL, NULL, 0, ctx);
@@ -206,28 +254,29 @@ static int eval_expr(AVFilterContext *ctx)
 
     s->y = res;
 
-    if (s->x < 0 || s->x + s->in_w > s->w) {
-        s->x = (s->w - s->in_w) / 2;
+    if (s->x < 0 || s->x + s->scaled_w > s->w) {
+        s->x = (s->w - s->scaled_w) / 2;
         av_log(ctx, AV_LOG_VERBOSE, "centering X offset.\n");
     }
 
-    if (s->y < 0 || s->y + s->in_h > s->h) {
-        s->y = (s->h - s->in_h) / 2;
+    if (s->y < 0 || s->y + s->scaled_h > s->h) {
+        s->y = (s->h - s->scaled_h) / 2;
         av_log(ctx, AV_LOG_VERBOSE, "centering Y offset.\n");
     }
 
     s->w = av_clip(s->w, 1, INT_MAX);
     s->h = av_clip(s->h, 1, INT_MAX);
 
-    if (s->w < s->in_w || s->h < s->in_h) {
+    if (!s->auto_scale && (s->w < s->in_w || s->h < s->in_h)) {
         av_log(ctx, AV_LOG_ERROR, "Padded size < input size.\n");
         return AVERROR(EINVAL);
     }
 
     av_log(ctx, AV_LOG_DEBUG,
-           "w:%d h:%d -> w:%d h:%d x:%d y:%d color:0x%02X%02X%02X%02X\n",
-           inlink->w, inlink->h, s->w, s->h, s->x, s->y, s->rgba_color[0],
-           s->rgba_color[1], s->rgba_color[2], s->rgba_color[3]);
+           "w:%d h:%d -> w:%d h:%d x:%d y:%d scaled:%dx%d auto_scale:%d color:0x%02X%02X%02X%02X\n",
+           inlink->w, inlink->h, s->w, s->h, s->x, s->y, s->scaled_w, s->scaled_h,
+           s->auto_scale, s->rgba_color[0], s->rgba_color[1], s->rgba_color[2],
+           s->rgba_color[3]);
 
     return 0;
 
@@ -319,13 +368,49 @@ static av_cold int cuda_pad_load_functions(AVFilterContext *ctx)
 
     ret = CHECK_CU(cu->cuModuleGetFunction(&s->cu_func_uchar, s->cu_module, "pad_uchar"));
     if (ret < 0) {
-        av_log(ctx, AV_LOG_ERROR, "Failed to load pad_planar_cuda\n");
+        av_log(ctx, AV_LOG_ERROR, "Failed to load pad_uchar\n");
         goto end;
     }
 
     ret = CHECK_CU(cu->cuModuleGetFunction(&s->cu_func_uchar2, s->cu_module, "pad_uchar2"));
+    if (ret < 0) {
+        av_log(ctx, AV_LOG_ERROR, "Failed to load pad_uchar2\n");
+        goto end;
+    }
+
+    ret = CHECK_CU(cu->cuModuleGetFunction(&s->cu_func_ushort, s->cu_module, "pad_ushort"));
+    if (ret < 0) {
+        av_log(ctx, AV_LOG_ERROR, "Failed to load pad_ushort\n");
+        goto end;
+    }
+
+    ret = CHECK_CU(cu->cuModuleGetFunction(&s->cu_func_ushort2, s->cu_module, "pad_ushort2"));
+    if (ret < 0) {
+        av_log(ctx, AV_LOG_ERROR, "Failed to load pad_ushort2\n");
+        goto end;
+    }
+
+    ret = CHECK_CU(cu->cuModuleGetFunction(&s->cu_func_scale_uchar, s->cu_module, "pad_scale_uchar"));
+    if (ret < 0) {
+        av_log(ctx, AV_LOG_ERROR, "Failed to load pad_scale_uchar\n");
+        goto end;
+    }
+
+    ret = CHECK_CU(cu->cuModuleGetFunction(&s->cu_func_scale_uchar2, s->cu_module, "pad_scale_uchar2"));
+    if (ret < 0) {
+        av_log(ctx, AV_LOG_ERROR, "Failed to load pad_scale_uchar2\n");
+        goto end;
+    }
+
+    ret = CHECK_CU(cu->cuModuleGetFunction(&s->cu_func_scale_ushort, s->cu_module, "pad_scale_ushort"));
+    if (ret < 0) {
+        av_log(ctx, AV_LOG_ERROR, "Failed to load pad_scale_ushort\n");
+        goto end;
+    }
+
+    ret = CHECK_CU(cu->cuModuleGetFunction(&s->cu_func_scale_ushort2, s->cu_module, "pad_scale_ushort2"));
     if (ret < 0)
-        av_log(ctx, AV_LOG_ERROR, "Failed to load pad_uv_cuda\n");
+        av_log(ctx, AV_LOG_ERROR, "Failed to load pad_scale_ushort2\n");
 
 end:
     CHECK_CU(cu->cuCtxPopCurrent(&dummy_cu_ctx));
@@ -347,12 +432,6 @@ static int cuda_pad_config_props(AVFilterLink *outlink)
     int format_supported = 0;
     int ret;
 
-    s->in_w = inlink->w;
-    s->in_h = inlink->h;
-    ret = eval_expr(ctx);
-    if (ret < 0)
-        return ret;
-
     if (!inl->hw_frames_ctx) {
         av_log(ctx, AV_LOG_ERROR, "No hw context provided on input\n");
         return AVERROR(EINVAL);
@@ -372,10 +451,29 @@ static int cuda_pad_config_props(AVFilterLink *outlink)
         return AVERROR(EINVAL);
     }
 
-    s->parsed_color[0] = RGB_TO_Y_BT709(s->rgba_color[0], s->rgba_color[1], s->rgba_color[2]);
-    s->parsed_color[1] = RGB_TO_U_BT709(s->rgba_color[0], s->rgba_color[1], s->rgba_color[2], 0);
-    s->parsed_color[2] = RGB_TO_V_BT709(s->rgba_color[0], s->rgba_color[1], s->rgba_color[2], 0);
-    s->parsed_color[3] = s->rgba_color[3];
+    s->in_w = inlink->w;
+    s->in_h = inlink->h;
+    ret = eval_expr(ctx);
+    if (ret < 0)
+        return ret;
+
+    {
+        const uint8_t y8 = RGB_TO_Y_BT709(s->rgba_color[0], s->rgba_color[1], s->rgba_color[2]);
+        const uint8_t u8 = RGB_TO_U_BT709(s->rgba_color[0], s->rgba_color[1], s->rgba_color[2], 0);
+        const uint8_t v8 = RGB_TO_V_BT709(s->rgba_color[0], s->rgba_color[1], s->rgba_color[2], 0);
+
+        if (in_frames_ctx->sw_format == AV_PIX_FMT_P010) {
+            s->fill[0] = ((y8 * 1023 + 127) / 255) << 6;
+            s->fill[1] = ((u8 * 1023 + 127) / 255) << 6;
+            s->fill[2] = ((v8 * 1023 + 127) / 255) << 6;
+            s->fill[3] = ((s->rgba_color[3] * 1023 + 127) / 255) << 6;
+        } else {
+            s->fill[0] = y8;
+            s->fill[1] = u8;
+            s->fill[2] = v8;
+            s->fill[3] = s->rgba_color[3];
+        }
+    }
 
     ret = cuda_pad_alloc_out_frames_ctx(ctx, &s->frames_ctx, s->w, s->h);
     if (ret < 0)
@@ -422,8 +520,13 @@ static int cuda_pad_pad(AVFilterContext *ctx, AVFrame *out, const AVFrame *in)
         int hsub = (plane == 1 || plane == 2) ? pixdesc->log2_chroma_w : 0;
         int vsub = (plane == 1 || plane == 2) ? pixdesc->log2_chroma_h : 0;
 
+        /* Original input size — used for bilinear sampling when auto_scale=1 */
         int src_w = AV_CEIL_RSHIFT(s->in_w, hsub);
         int src_h = AV_CEIL_RSHIFT(s->in_h, vsub);
+
+        /* ROI size on the output canvas (scaled when auto_scale=1) */
+        int roi_w = AV_CEIL_RSHIFT(s->scaled_w, hsub);
+        int roi_h = AV_CEIL_RSHIFT(s->scaled_h, vsub);
 
         int dst_w = AV_CEIL_RSHIFT(s->w, hsub);
         int dst_h = AV_CEIL_RSHIFT(s->h, vsub);
@@ -431,11 +534,11 @@ static int cuda_pad_pad(AVFilterContext *ctx, AVFrame *out, const AVFrame *in)
         int y_plane_offset = AV_CEIL_RSHIFT(s->y, vsub);
         int x_plane_offset = AV_CEIL_RSHIFT(s->x, hsub);
 
-        if (x_plane_offset + src_w > dst_w || y_plane_offset + src_h > dst_h) {
+        if (x_plane_offset + roi_w > dst_w || y_plane_offset + roi_h > dst_h) {
             av_log(ctx, AV_LOG_ERROR,
-                   "ROI out of bounds in plane %d: offset=(%d,%d) in=(%dx%d) "
+                   "ROI out of bounds in plane %d: offset=(%d,%d) roi=(%dx%d) "
                    "out=(%dx%d)\n",
-                   plane, x_plane_offset, y_plane_offset, src_w, src_h, dst_w, dst_h);
+                   plane, x_plane_offset, y_plane_offset, roi_w, roi_h, dst_w, dst_h);
             return AVERROR(EINVAL);
         }
 
@@ -446,26 +549,58 @@ static int cuda_pad_pad(AVFilterContext *ctx, AVFrame *out, const AVFrame *in)
         CUdeviceptr d_src = (CUdeviceptr)in->data[plane];
 
         CUfunction cuda_func;
+        uint8_t fill8;
+        uint8_t fill8x2[2];
+        void *fill_arg;
 
-        if (cur_comp->step == 1 && cur_comp->depth == 8)
-            cuda_func = s->cu_func_uchar;
-        else if(cur_comp->step == 2 && cur_comp->depth == 8)
-            cuda_func = s->cu_func_uchar2;
-        else
+        if (cur_comp->depth == 8 && cur_comp->step == 1) {
+            cuda_func = s->auto_scale ? s->cu_func_scale_uchar : s->cu_func_uchar;
+            fill8 = (uint8_t)s->fill[plane];
+            fill_arg = &fill8;
+        } else if (cur_comp->depth == 8 && cur_comp->step == 2) {
+            cuda_func = s->auto_scale ? s->cu_func_scale_uchar2 : s->cu_func_uchar2;
+            fill8x2[0] = (uint8_t)s->fill[1];
+            fill8x2[1] = (uint8_t)s->fill[2];
+            fill_arg = fill8x2;
+        } else if (cur_comp->depth == 10 && cur_comp->step == 2) {
+            cuda_func = s->auto_scale ? s->cu_func_scale_ushort : s->cu_func_ushort;
+            fill_arg = &s->fill[plane];
+        } else if (cur_comp->depth == 10 && cur_comp->step == 4) {
+            cuda_func = s->auto_scale ? s->cu_func_scale_ushort2 : s->cu_func_ushort2;
+            /* Pack U/V into contiguous ushort2 for the kernel */
+            fill8x2[0] = 0; /* unused; use fill16 below */
+            fill_arg = &s->fill[1]; /* fill[1]=U, fill[2]=V contiguous */
+        } else {
+            av_log(ctx, AV_LOG_ERROR,
+                   "Unsupported plane layout: plane=%d depth=%d step=%d\n",
+                   plane, cur_comp->depth, cur_comp->step);
             return AVERROR_BUG;
-
-        void *kernel_args[] = {
-            &d_dst, &dst_linesize, &dst_w, &dst_h,
-            &d_src, &src_linesize, &src_w, &src_h,
-            &x_plane_offset, &y_plane_offset, &s->parsed_color[plane]
-        };
+        }
 
         unsigned int grid_x = DIV_UP(dst_w, BLOCK_X);
         unsigned int grid_y = DIV_UP(dst_h, BLOCK_Y);
 
-        ret = CHECK_CU(cu->cuLaunchKernel(cuda_func, grid_x, grid_y, 1,
-                                          BLOCK_X, BLOCK_Y, 1,
-                                          0, s->hwctx->stream, kernel_args, NULL));
+        if (s->auto_scale) {
+            void *kernel_args[] = {
+                &d_dst, &dst_linesize, &dst_w, &dst_h,
+                &d_src, &src_linesize, &src_w, &src_h,
+                &x_plane_offset, &y_plane_offset, &roi_w, &roi_h,
+                fill_arg
+            };
+            ret = CHECK_CU(cu->cuLaunchKernel(cuda_func, grid_x, grid_y, 1,
+                                              BLOCK_X, BLOCK_Y, 1,
+                                              0, s->hwctx->stream, kernel_args, NULL));
+        } else {
+            /* Pad-only path: ROI size equals source size */
+            void *kernel_args[] = {
+                &d_dst, &dst_linesize, &dst_w, &dst_h,
+                &d_src, &src_linesize, &src_w, &src_h,
+                &x_plane_offset, &y_plane_offset, fill_arg
+            };
+            ret = CHECK_CU(cu->cuLaunchKernel(cuda_func, grid_x, grid_y, 1,
+                                              BLOCK_X, BLOCK_Y, 1,
+                                              0, s->hwctx->stream, kernel_args, NULL));
+        }
 
         if (ret < 0) {
             av_log(ctx, AV_LOG_ERROR, "Failed to launch kernel for plane %d\n", plane);
@@ -502,7 +637,7 @@ static int cuda_pad_filter_frame(AVFilterLink *inlink, AVFrame *in)
     }
 
 
-    if (s->x == 0 && s->y == 0 &&
+    if (!s->auto_scale && s->x == 0 && s->y == 0 &&
         s->w == in->width && s->h == in->height) {
         av_log(ctx, AV_LOG_DEBUG, "No border. Passing the frame unmodified.\n");
         s->last_out_w = s->w;
@@ -596,6 +731,7 @@ static const AVOption cuda_pad_options[] = {
          { "init",  "eval expressions once during initialization", 0, AV_OPT_TYPE_CONST, {.i64=EVAL_MODE_INIT},  .flags = FLAGS, .unit = "eval" },
          { "frame", "eval expressions during initialization and per-frame", 0, AV_OPT_TYPE_CONST, {.i64=EVAL_MODE_FRAME}, .flags = FLAGS, .unit = "eval" },
     { "aspect", "pad to fit an aspect instead of a resolution",                  OFFSET(aspect),     AV_OPT_TYPE_RATIONAL, {.dbl = 0},        0, DBL_MAX,    FLAGS },
+    { "auto_scale", "scale input to fit inside pad area then pad (bilinear)",   OFFSET(auto_scale), AV_OPT_TYPE_INT,      {.i64 = 0},        0, 1,          FLAGS },
     { NULL }
 };
 

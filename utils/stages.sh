@@ -2283,9 +2283,11 @@ _build_ffmpeg_into_usr() {
   fi
 
   _info "configure FFmpeg → prefix=build/release"
-  # 头文件内联工具较多，抑制 unused-function 警告
-  local _ff_cflags="$FF_CFLAGS $CFLAGS -Wno-unused-function"
-  local _ff_cxxflags="$FF_CXXFLAGS $CXXFLAGS -Wno-unused-function"
+  # 抑制噪声警告：自研头文件 unused-function；上游/第三方 stack/format/main/deprecated 等
+  # 注意：禁用 stack-usage 须写 -Wno-stack-usage（不要带 =），否则 gcc 报 unrecognized 导致 configure 失败
+  local _ff_warn_cflags="-Wno-unused-function -Wno-stack-usage -Wno-format-truncation -Wno-main -Wno-deprecated-declarations -Wno-redundant-decls"
+  local _ff_cflags="$FF_CFLAGS $CFLAGS $_ff_warn_cflags"
+  local _ff_cxxflags="$FF_CXXFLAGS $CXXFLAGS $_ff_warn_cflags"
   # shellcheck disable=SC2086
   if ! _run "ffmpeg-configure" ./configure \
       --prefix="$USR_DIR" \

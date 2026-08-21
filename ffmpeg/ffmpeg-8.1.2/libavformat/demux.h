@@ -169,6 +169,13 @@ typedef struct FFInputFormat {
                           enum AVFormatCommandID id, void *data);
 
     /**
+     * Optional string command handler (ZMQ / avformat_process_command).
+     * NULL means this demuxer ignores those commands.
+     */
+    int (*process_command)(AVFormatContext *s, const char *cmd, const char *arg,
+                           char *res, int res_len, int flags);
+
+    /**
      * Seek to timestamp ts.
      * Seeking will be done so that the point from which all active streams
      * can be presented successfully will be closest to ts and within min/max_ts.

@@ -2989,6 +2989,13 @@ void av_fast_padded_mallocz(void *ptr, unsigned int *size, size_t min_size);
 int avcodec_is_open(AVCodecContext *s);
 
 /**
+ * Send a runtime command to a codec instance.
+ * Codecs without a process_command callback return AVERROR(ENOSYS).
+ */
+int avcodec_process_command(AVCodecContext *avctx, const char *cmd, const char *arg,
+                            char *res, int res_len, int flags);
+
+/**
  * @}
  */
 

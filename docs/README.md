@@ -2,6 +2,28 @@
 
 本目录是可独立编译的 FFmpeg 构建树本地实现。
 
+## 文档索引（快速跳转）
+
+每个滤镜 **只保留一个** `docs/<name>.md`（含设计、变更记录、参数、示例、注意事项、踩坑）。
+
+| 滤镜 / 模块 | 文档 |
+|-------------|------|
+| `mixing_cuda`（会议合屏整链路） | [mixing_cuda.md](./mixing_cuda.md) |
+| 合屏导播控制台（浏览器） | [mix_console.html](./mix_console.html) |
+| `dynamic_input` | [dynamic_input.md](./dynamic_input.md) |
+| `color_cuda` | [color_cuda.md](./color_cuda.md) |
+| `amixrank` | [amixrank.md](./amixrank.md) |
+| `eq_cuda` | [eq_cuda.md](./eq_cuda.md) |
+| `curves_cuda` | [curves_cuda.md](./curves_cuda.md) |
+| `pad_cuda` | [pad_cuda.md](./pad_cuda.md) |
+| `detect_cuda` | [detect_cuda.md](./detect_cuda.md) |
+| `tonemap_cuda` | [tonemap_cuda.md](./tonemap_cuda.md) |
+| `hlg2pq_cuda` | [hlg2pq_cuda.md](./hlg2pq_cuda.md) |
+| 进程级 `-zmq`（滤镜增删改查、nvenc 码率、concat 切源、ffmpeg 退出） | [zmq.md](./zmq.md) |
+
+合屏设计规格（可选深入）：[superpowers/specs/](./superpowers/specs/)
+
+
 ## 布局
 
 ```

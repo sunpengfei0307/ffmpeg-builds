@@ -25,6 +25,7 @@
 
 #include "config_components.h"
 
+#include <string.h>
 #include <zmq.h>
 #include "libavutil/avstring.h"
 #include "libavutil/mem.h"
@@ -111,7 +112,18 @@ static int parse_command(Command *cmd, const char *command_str, void *log_ctx)
         return AVERROR(EINVAL);
     }
 
-    cmd->arg = av_get_token(buf, SPACES);
+    /* Rest of the line is the argument (supports "update 1 rtmp://...").
+     * Quoted single-token args still work via av_get_token. */
+    while (**buf && strchr(SPACES, **buf))
+        (*buf)++;
+    if (**buf == '\'' || **buf == '"')
+        cmd->arg = av_get_token(buf, SPACES);
+    else if (**buf)
+        cmd->arg = av_strdup(*buf);
+    else
+        cmd->arg = av_strdup("");
+    if (!cmd->arg)
+        return AVERROR(ENOMEM);
     return 0;
 }
 
@@ -165,17 +177,33 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *ref)
         if (recv_msg(ctx, &recv_buf, &recv_buf_size) < 0)
             break;
         zmq->command_count++;
+        cmd_buf[0] = 0;
+
+        av_log(ctx, AV_LOG_WARNING,
+               "zmq: recv #%d raw='%s'\n", zmq->command_count, recv_buf);
 
         /* parse command */
         if (parse_command(&cmd, recv_buf, ctx) < 0) {
-            av_log(ctx, AV_LOG_ERROR, "Could not parse command #%d\n", zmq->command_count);
+            av_log(ctx, AV_LOG_ERROR,
+                   "zmq: parse failed #%d raw='%s' "
+                   "(need: <filter> <command> [args…])\n",
+                   zmq->command_count, recv_buf);
+            send_buf = av_asprintf("%d %s\nparse failed: %s",
+                                   AVERROR(EINVAL), av_err2str(AVERROR(EINVAL)),
+                                   recv_buf);
+            if (send_buf &&
+                zmq_send(zmq->responder, send_buf, strlen(send_buf), 0) == -1)
+                av_log(ctx, AV_LOG_ERROR,
+                       "zmq: failed to send parse-error reply #%d: %s\n",
+                       zmq->command_count, zmq_strerror(errno));
             goto end;
         }
 
-        /* process command */
-        av_log(ctx, AV_LOG_VERBOSE,
-               "Processing command #%d target:%s command:%s arg:%s\n",
-               zmq->command_count, cmd.target, cmd.command, cmd.arg);
+        /* process command — always log at WARNING so ops see every dynamic cmd */
+        av_log(ctx, AV_LOG_WARNING,
+               "zmq: dispatch #%d target=%s cmd=%s args='%s'\n",
+               zmq->command_count, cmd.target, cmd.command,
+               cmd.arg ? cmd.arg : "");
         ret = avfilter_graph_send_command(ff_filter_link(inlink)->graph,
                                           cmd.target, cmd.command, cmd.arg,
                                           cmd_buf, sizeof(cmd_buf),
@@ -186,12 +214,19 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *ref)
             ret = AVERROR(ENOMEM);
             goto end;
         }
-        av_log(ctx, AV_LOG_VERBOSE,
-               "Sending command reply for command #%d:\n%s\n",
-               zmq->command_count, send_buf);
+        if (ret < 0)
+            av_log(ctx, AV_LOG_ERROR,
+                   "zmq: FAILED #%d target=%s cmd=%s args='%s' -> %s (%d)%s%s\n",
+                   zmq->command_count, cmd.target, cmd.command,
+                   cmd.arg ? cmd.arg : "", av_err2str(ret), ret,
+                   cmd_buf[0] ? " detail=" : "", cmd_buf);
+        else
+            av_log(ctx, AV_LOG_WARNING,
+                   "zmq: ok #%d target=%s cmd=%s reply='%s'\n",
+                   zmq->command_count, cmd.target, cmd.command, send_buf);
         if (zmq_send(zmq->responder, send_buf, strlen(send_buf), 0) == -1)
-            av_log(ctx, AV_LOG_ERROR, "Failed to send reply for command #%d: %s\n",
-                   zmq->command_count, zmq_strerror(ret));
+            av_log(ctx, AV_LOG_ERROR, "zmq: failed to send reply #%d: %s\n",
+                   zmq->command_count, zmq_strerror(errno));
 
     end:
         av_freep(&send_buf);

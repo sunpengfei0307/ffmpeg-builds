@@ -1776,3 +1776,16 @@ int dec_filter_add(Decoder *d, InputFilter *ifilter, InputFilterOptions *opts,
 
     return dec_request_view(d, vs, src);
 }
+
+int dec_process_command(InputStream *ist, const char *cmd, const char *arg,
+                        char *res, int res_len, int flags)
+{
+    DecoderPriv *dp;
+
+    if (!ist || !ist->decoder)
+        return AVERROR(ENOSYS);
+    dp = dp_from_dec(ist->decoder);
+    if (!dp->dec_ctx)
+        return AVERROR(ENOSYS);
+    return avcodec_process_command(dp->dec_ctx, cmd, arg, res, res_len, flags);
+}

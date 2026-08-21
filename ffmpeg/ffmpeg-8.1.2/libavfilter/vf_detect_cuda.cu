@@ -204,6 +204,182 @@ __device__ inline int on_box_border(int x, int y, const DetectBox *b, int thickn
            (y - top < thickness) || (bottom - y < thickness);
 }
 
+__device__ inline int point_in_face_box(int x, int y, const DetectBox *boxes,
+                                         int n, int face_class_id, float pad_ratio)
+{
+    int i;
+    for (i = 0; i < n; i++) {
+        float bw, bh, pad;
+        int left, right, top, bottom;
+        if (boxes[i].class_id != face_class_id)
+            continue;
+        bw = boxes[i].x2 - boxes[i].x1;
+        bh = boxes[i].y2 - boxes[i].y1;
+        pad = pad_ratio * fminf(bw, bh);
+        left = (int)floorf(boxes[i].x1 - pad);
+        top = (int)floorf(boxes[i].y1 - pad);
+        right = (int)ceilf(boxes[i].x2 + pad);
+        bottom = (int)ceilf(boxes[i].y2 + pad);
+        if (x >= left && x <= right && y >= top && y <= bottom)
+            return 1;
+    }
+    return 0;
+}
+
+__device__ inline void write_luma(unsigned char *y, int pitch, int x, int y_pos,
+                                  int fmt, int bit_depth, float val)
+{
+    val = clampf(val, 0.0f, 1.0f);
+    if (fmt == DETECT_FMT_P010) {
+        unsigned short *row = (unsigned short *)(y + y_pos * pitch);
+        unsigned int maxv = (1u << bit_depth) - 1u;
+        row[x] = (unsigned short)((unsigned int)(val * maxv + 0.5f) << (16 - bit_depth));
+    } else {
+        y[y_pos * pitch + x] = (unsigned char)(val * 255.0f + 0.5f);
+    }
+}
+
+__device__ inline void write_chroma(unsigned char *uv, unsigned char *vplane,
+                                    int pitch_uv, int pitch_v, int x, int y_pos,
+                                    int fmt, int bit_depth, float u, float v)
+{
+    u = clampf(u, 0.0f, 1.0f);
+    v = clampf(v, 0.0f, 1.0f);
+    if (fmt == DETECT_FMT_P010) {
+        unsigned short *row = (unsigned short *)(uv + y_pos * pitch_uv);
+        unsigned int maxv = (1u << bit_depth) - 1u;
+        row[(x << 1) + 0] = (unsigned short)((unsigned int)(u * maxv + 0.5f) << (16 - bit_depth));
+        row[(x << 1) + 1] = (unsigned short)((unsigned int)(v * maxv + 0.5f) << (16 - bit_depth));
+    } else if (fmt == DETECT_FMT_NV12) {
+        unsigned char *row = uv + y_pos * pitch_uv;
+        row[(x << 1) + 0] = (unsigned char)(u * 255.0f + 0.5f);
+        row[(x << 1) + 1] = (unsigned char)(v * 255.0f + 0.5f);
+    } else {
+        uv[y_pos * pitch_uv + x] = (unsigned char)(u * 255.0f + 0.5f);
+        vplane[y_pos * pitch_v + x] = (unsigned char)(v * 255.0f + 0.5f);
+    }
+}
+
+/*
+ * Face-ROI bilateral (bilateral_cuda-style). Reads src, writes dst only inside
+ * face boxes; sigmaS/sigmaR are in pixel / 0-255 color units.
+ */
+extern "C" __global__ void detect_bilateral_face_y(const unsigned char *src_y,
+                                                    unsigned char *dst_y,
+                                                    int pitch_src_y,
+                                                    int pitch_dst_y,
+                                                    int width, int height,
+                                                    int fmt, int bit_depth,
+                                                    const DetectBox *boxes,
+                                                    const int *count,
+                                                    int max_det,
+                                                    int face_class_id,
+                                                    int window_size,
+                                                    float sigmaS,
+                                                    float sigmaR)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    int n = min(count ? *count : 0, max_det);
+    int half, i, j, r, c;
+    float cy, Wp, acc, w, ny;
+    float inv_2s = 1.0f / (2.0f * sigmaS * sigmaS);
+    float inv_2r = 1.0f / (2.0f * sigmaR * sigmaR);
+
+    if (x >= width || y >= height || window_size < 1 || n <= 0)
+        return;
+    if (!point_in_face_box(x, y, boxes, n, face_class_id, 0.08f))
+        return;
+
+    half = window_size / 2;
+    cy = read_luma(src_y, pitch_src_y, x, y, fmt, bit_depth) * 255.0f;
+    Wp = 0.0f;
+    acc = 0.0f;
+
+    for (j = -half; j <= half; j++) {
+        for (i = -half; i <= half; i++) {
+            r = clampi(x + i, 0, width - 1);
+            c = clampi(y + j, 0, height - 1);
+            ny = read_luma(src_y, pitch_src_y, r, c, fmt, bit_depth) * 255.0f;
+            w = __expf(-((float)(i * i + j * j)) * inv_2s -
+                       ((ny - cy) * (ny - cy)) * inv_2r);
+            Wp += w;
+            acc += ny * w;
+        }
+    }
+    if (Wp > 1e-6f)
+        write_luma(dst_y, pitch_dst_y, x, y, fmt, bit_depth, (acc / Wp) / 255.0f);
+}
+
+extern "C" __global__ void detect_bilateral_face_uv(const unsigned char *src_y,
+                                                     const unsigned char *src_u,
+                                                     const unsigned char *src_v,
+                                                     unsigned char *dst_u,
+                                                     unsigned char *dst_v,
+                                                     int pitch_src_y,
+                                                     int pitch_src_u,
+                                                     int pitch_src_v,
+                                                     int pitch_dst_u,
+                                                     int pitch_dst_v,
+                                                     int width, int height,
+                                                     int fmt, int bit_depth,
+                                                     const DetectBox *boxes,
+                                                     const int *count,
+                                                     int max_det,
+                                                     int face_class_id,
+                                                     int window_size,
+                                                     float sigmaS,
+                                                     float sigmaR)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    int px = x << 1;
+    int py = y << 1;
+    int n = min(count ? *count : 0, max_det);
+    int half, i, j, r, c, rr, cc;
+    float cy, cu, cv, Wp, acc_u, acc_v, w, ny, nu, nv, d2;
+    float inv_2s = 1.0f / (2.0f * sigmaS * sigmaS);
+    float inv_2r = 1.0f / (2.0f * sigmaR * sigmaR);
+
+    if (px >= width || py >= height || window_size < 1 || n <= 0)
+        return;
+    if (!point_in_face_box(px, py, boxes, n, face_class_id, 0.08f) &&
+        !point_in_face_box(px + 1, py, boxes, n, face_class_id, 0.08f) &&
+        !point_in_face_box(px, py + 1, boxes, n, face_class_id, 0.08f) &&
+        !point_in_face_box(px + 1, py + 1, boxes, n, face_class_id, 0.08f))
+        return;
+
+    half = window_size / 2;
+    cy = read_luma(src_y, pitch_src_y, px, py, fmt, bit_depth) * 255.0f;
+    read_chroma(src_u, src_v, pitch_src_u, pitch_src_v, x, y, fmt, bit_depth, &cu, &cv);
+    cu *= 255.0f;
+    cv *= 255.0f;
+    Wp = 0.0f;
+    acc_u = 0.0f;
+    acc_v = 0.0f;
+
+    for (j = -half; j <= half; j++) {
+        for (i = -half; i <= half; i++) {
+            rr = clampi(px + i, 0, width - 1);
+            cc = clampi(py + j, 0, height - 1);
+            r = rr >> 1;
+            c = cc >> 1;
+            ny = read_luma(src_y, pitch_src_y, rr, cc, fmt, bit_depth) * 255.0f;
+            read_chroma(src_u, src_v, pitch_src_u, pitch_src_v, r, c, fmt, bit_depth, &nu, &nv);
+            nu *= 255.0f;
+            nv *= 255.0f;
+            d2 = (ny - cy) * (ny - cy) + (nu - cu) * (nu - cu) + (nv - cv) * (nv - cv);
+            w = __expf(-((float)(i * i + j * j)) * inv_2s - d2 * inv_2r);
+            Wp += w;
+            acc_u += nu * w;
+            acc_v += nv * w;
+        }
+    }
+    if (Wp > 1e-6f)
+        write_chroma(dst_u, dst_v, pitch_dst_u, pitch_dst_v, x, y, fmt, bit_depth,
+                     (acc_u / Wp) / 255.0f, (acc_v / Wp) / 255.0f);
+}
+
 extern "C" __global__ void detect_draw_y(unsigned char *dst_y,
                                           int pitch_y,
                                           int width, int height,

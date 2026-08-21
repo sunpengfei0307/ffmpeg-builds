@@ -108,6 +108,8 @@ typedef struct CUDADetectContext {
     CUfunction cu_func_yolo_decode;
     CUfunction cu_func_draw_y;
     CUfunction cu_func_draw_uv;
+    CUfunction cu_func_bilateral_y;
+    CUfunction cu_func_bilateral_uv;
     CUstream cu_stream;
 
     /* Input sw_format from hw_frames_ctx */
@@ -143,6 +145,7 @@ typedef struct CUDADetectContext {
     int pool_size;
     int want_person;
     int want_face;
+    int bilateral; /* 0=off, 1/2/3=weak/medium/strong face beauty */
 
     /* Per-frame detection state (cached across stride skips) */
     int frame_index;
@@ -541,6 +544,14 @@ static av_cold int detect_cuda_load_functions(AVFilterContext *ctx)
         goto fail;
     ret = CHECK_CU(cu->cuModuleGetFunction(&s->cu_func_draw_uv, s->cu_module,
                                            "detect_draw_uv"));
+    if (ret < 0)
+        goto fail;
+    ret = CHECK_CU(cu->cuModuleGetFunction(&s->cu_func_bilateral_y, s->cu_module,
+                                           "detect_bilateral_face_y"));
+    if (ret < 0)
+        goto fail;
+    ret = CHECK_CU(cu->cuModuleGetFunction(&s->cu_func_bilateral_uv, s->cu_module,
+                                           "detect_bilateral_face_uv"));
 
 fail:
     CHECK_CU(cu->cuCtxPopCurrent(&dummy));
@@ -796,6 +807,77 @@ static int launch_yolo_decode(AVFilterContext *ctx, AVFrame *frame,
                                        threads, 1, 1, 0, s->cu_stream, args, NULL));
 }
 
+/* Face-ROI bilateral beauty presets: sigmaS/sigmaR in pixel / 0-255 units. */
+static const struct {
+    float sigmaS;
+    float sigmaR;
+    int window_size;
+} detect_bilateral_presets[4] = {
+    { 0.f,  0.f,  0 },
+    { 3.f, 12.f,  5 }, /* weak */
+    { 6.f, 25.f,  7 }, /* medium */
+    { 10.f, 40.f, 9 }, /* strong */
+};
+
+static int launch_bilateral_faces(AVFilterContext *ctx, AVFrame *src, AVFrame *dst)
+{
+    CUDADetectContext *s = ctx->priv;
+    CudaFunctions *cu = s->hwctx->internal->cuda_dl;
+    int level = s->bilateral;
+    float sigmaS, sigmaR;
+    int window_size;
+    int uv_w = AV_CEIL_RSHIFT(dst->width, s->desc->log2_chroma_w);
+    int uv_h = AV_CEIL_RSHIFT(dst->height, s->desc->log2_chroma_h);
+    CUdeviceptr src_y = (CUdeviceptr)src->data[0];
+    CUdeviceptr src_u = (CUdeviceptr)src->data[1];
+    CUdeviceptr src_v = s->sw_format == AV_PIX_FMT_YUV420P ? (CUdeviceptr)src->data[2] : 0;
+    CUdeviceptr dst_y = (CUdeviceptr)dst->data[0];
+    CUdeviceptr dst_u = (CUdeviceptr)dst->data[1];
+    CUdeviceptr dst_v = s->sw_format == AV_PIX_FMT_YUV420P ? (CUdeviceptr)dst->data[2] : 0;
+    int pitch_src_y = src->linesize[0];
+    int pitch_src_u = src->linesize[1];
+    int pitch_src_v = s->sw_format == AV_PIX_FMT_YUV420P ? src->linesize[2] : 0;
+    int pitch_dst_y = dst->linesize[0];
+    int pitch_dst_u = dst->linesize[1];
+    int pitch_dst_v = s->sw_format == AV_PIX_FMT_YUV420P ? dst->linesize[2] : 0;
+    void *args_y[] = {
+        &src_y, &dst_y, &pitch_src_y, &pitch_dst_y, &dst->width, &dst->height,
+        &s->detect_format, &s->bit_depth, &s->boxes_dev, &s->count_dev,
+        &s->max_det, &s->face_class_id, &window_size, &sigmaS, &sigmaR,
+    };
+    void *args_uv[] = {
+        &src_y, &src_u, &src_v, &dst_u, &dst_v,
+        &pitch_src_y, &pitch_src_u, &pitch_src_v, &pitch_dst_u, &pitch_dst_v,
+        &dst->width, &dst->height, &s->detect_format, &s->bit_depth,
+        &s->boxes_dev, &s->count_dev, &s->max_det, &s->face_class_id,
+        &window_size, &sigmaS, &sigmaR,
+    };
+    int ret;
+
+    if (level <= 0 || !s->want_face || s->last_count <= 0)
+        return 0;
+    if (level > 3)
+        level = 3;
+
+    sigmaS = detect_bilateral_presets[level].sigmaS;
+    sigmaR = detect_bilateral_presets[level].sigmaR;
+    window_size = detect_bilateral_presets[level].window_size | 1;
+
+    ret = CHECK_CU(cu->cuLaunchKernel(s->cu_func_bilateral_y,
+                                      DIV_UP(dst->width, BLOCKX),
+                                      DIV_UP(dst->height, BLOCKY),
+                                      1, BLOCKX, BLOCKY, 1, 0,
+                                      s->cu_stream, args_y, NULL));
+    if (ret < 0)
+        return ret;
+
+    return CHECK_CU(cu->cuLaunchKernel(s->cu_func_bilateral_uv,
+                                       DIV_UP(uv_w, BLOCKX),
+                                       DIV_UP(uv_h, BLOCKY),
+                                       1, BLOCKX, BLOCKY, 1, 0,
+                                       s->cu_stream, args_uv, NULL));
+}
+
 static int launch_draw(AVFilterContext *ctx, AVFrame *frame)
 {
     CUDADetectContext *s = ctx->priv;
@@ -1044,12 +1126,14 @@ static int run_trt_engine(AVFilterContext *ctx, AVFrame *frame,
 /*
  * Full detection pass for one frame:
  *   letterbox params -> preproc -> TRT (person and/or face) -> merge -> NMS
- *   -> optional draw. Box coordinates are mapped back to frame->width/height.
+ *   -> optional face bilateral -> optional draw.
+ * Box coordinates are mapped back to frame->width/height.
  */
-static int run_detection(AVFilterContext *ctx, AVFrame *frame)
+static int run_detection(AVFilterContext *ctx, AVFrame *dst, AVFrame *src)
 {
     CUDADetectContext *s = ctx->priv;
     CudaFunctions *cu = s->hwctx->internal->cuda_dl;
+    AVFrame *frame = dst;
     /* Letterbox: scale so the longer side fits input_size, center-pad to square */
     float ratio = FFMIN((float)s->input_size / frame->width,
                         (float)s->input_size / frame->height);
@@ -1133,15 +1217,24 @@ static int run_detection(AVFilterContext *ctx, AVFrame *frame)
     if (s->last_count > 0)
         memcpy(s->host_boxes, merged, (size_t)s->last_count * sizeof(*s->host_boxes));
 
-    /* Always sync finalized boxes; draw and ROI share this same list. */
+    /* Always sync finalized boxes; beauty/draw/ROI share this same list. */
     ret = sync_boxes_to_gpu(ctx);
     if (ret < 0)
         goto fail;
+
+    if (s->bilateral > 0) {
+        ret = launch_bilateral_faces(ctx, src, dst);
+        if (ret < 0)
+            goto fail;
+    }
 
     if (s->draw) {
         ret = launch_draw(ctx, frame);
         if (ret < 0)
             goto fail;
+    }
+
+    if (s->bilateral > 0 || s->draw) {
         ret = CHECK_CU(cu->cuStreamSynchronize(s->cu_stream));
         if (ret < 0)
             goto fail;
@@ -1194,13 +1287,17 @@ static int detect_cuda_filter_frame(AVFilterLink *link, AVFrame *src)
     /* stride>1: skip TRT and reuse last boxes; force infer when no prior dets */
     do_infer = s->stride <= 1 || (s->frame_index % s->stride) == 0 || s->last_count <= 0;
     if (do_infer) {
-        ret = run_detection(ctx, dst);
-    } else if (s->draw) { // 即使不检测，依然需要复用上次结果画框.
-        ret = launch_draw(ctx, dst);
+        ret = run_detection(ctx, dst, src);
+    } else {
+        /* Reuse last boxes: optional face beauty then optional draw. */
+        if (s->bilateral > 0)
+            ret = launch_bilateral_faces(ctx, src, dst);
+        else
+            ret = 0;
+        if (ret >= 0 && s->draw)
+            ret = launch_draw(ctx, dst);
         if (ret >= 0)
             ret = CHECK_CU(cu->cuStreamSynchronize(s->cu_stream));
-    } else {
-        ret = CHECK_CU(cu->cuStreamSynchronize(s->cu_stream));
     }
     if (ret < 0)
         goto pop_fail;
@@ -1390,6 +1487,20 @@ static av_cold int detect_cuda_config_props(AVFilterLink *outlink)
         return AVERROR(EINVAL);
     }
 
+    if (s->bilateral > 0 && !s->want_face) {
+        av_log(ctx, AV_LOG_WARNING,
+               "bilateral=%d ignored: face beauty needs targets including face\n",
+               s->bilateral);
+        s->bilateral = 0;
+    } else if (s->bilateral > 0) {
+        av_log(ctx, AV_LOG_INFO,
+               "face bilateral beauty level=%d (sigmaS=%.1f sigmaR=%.1f window=%d)\n",
+               s->bilateral,
+               detect_bilateral_presets[s->bilateral].sigmaS,
+               detect_bilateral_presets[s->bilateral].sigmaR,
+               detect_bilateral_presets[s->bilateral].window_size | 1);
+    }
+
     if (s->want_person && (!s->engine || !s->engine[0])) {
         av_log(ctx, AV_LOG_ERROR, "engine option is required for person detection\n");
         return AVERROR(EINVAL);
@@ -1572,6 +1683,7 @@ static const AVOption detect_cuda_options[] = {
     { "input_size", "Square model input size", OFFSET(input_size), AV_OPT_TYPE_INT, { .i64 = 640 }, 32, 4096, FLAGS },
     { "fp16", "Build ONNX engine with FP16 when supported", OFFSET(fp16), AV_OPT_TYPE_BOOL, { .i64 = 1 }, 0, 1, FLAGS },
     { "draw", "Draw detection boxes on output frames", OFFSET(draw), AV_OPT_TYPE_BOOL, { .i64 = 1 }, 0, 1, FLAGS },
+    { "bilateral", "Face-region beauty strength: 0=off, 1=weak, 2=medium, 3=strong", OFFSET(bilateral), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 3, FLAGS },
     { "thickness", "Box border thickness in pixels", OFFSET(thickness), AV_OPT_TYPE_INT, { .i64 = 1 }, 1, 16, FLAGS },
     { "face_qoffset", "ROI qoffset numerator for face (-1..1 maps via /100)", OFFSET(face_qoffset), AV_OPT_TYPE_INT, { .i64 = -100 }, -100, 100, FLAGS },
     { "person_qoffset", "ROI qoffset numerator for person (-1..1 maps via /100)", OFFSET(person_qoffset), AV_OPT_TYPE_INT, { .i64 = -100 }, -100, 100, FLAGS },
