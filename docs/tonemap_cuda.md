@@ -6,6 +6,7 @@
 
 | 日期 | 说明 |
 |------|------|
+| 2026-09-02 | FFmpeg 8 补回 NVIDIA Vulkan 对 CUDA 帧的协商（libplacebo 链路），见 [libplacebo.md](./libplacebo.md) |
 | 2026-08-06 | 合并 `tonemap_cuda.md` 与 `tonemap_cuda_integration.md` 为单文件 |
 
 ## 设计方案（核心功能）

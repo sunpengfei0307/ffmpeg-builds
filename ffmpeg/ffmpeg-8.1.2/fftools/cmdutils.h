@@ -247,6 +247,10 @@ typedef struct OptionDef {
 /* ffmpeg-only - OPT_PERFILE may apply to standalone decoders */
 #define OPT_DECODER     (1 << 15)
 
+/* OPT_TYPE_FUNC may take an optional argument. Consumed only when the
+ * next argv token does not look like an option (does not start with '-'). */
+#define OPT_FUNC_OPTARG (1 << 16)
+
      union {
         void *dst_ptr;
         int (*func_arg)(void *, const char *, const char *);

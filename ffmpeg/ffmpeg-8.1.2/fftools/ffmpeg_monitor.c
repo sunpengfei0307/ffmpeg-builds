@@ -23,6 +23,23 @@ static int64_t last_update_time;
 static volatile int monitor_got_sigterm;
 static ITimer *report_timer;
 
+/* First mapped video output has no encoder → -c:v copy / stream copy forward. */
+static int monitor_video_is_copy(void)
+{
+    for (OutputStream *ost = ost_iter(NULL); ost; ost = ost_iter(ost)) {
+        if (ost->type != AVMEDIA_TYPE_VIDEO)
+            continue;
+        if (ost->attachment_filename)
+            continue;
+        return ost->enc == NULL;
+    }
+    for (InputStream *ist = ist_iter(NULL); ist; ist = ist_iter(ist)) {
+        if (ist->par && ist->par->codec_type == AVMEDIA_TYPE_VIDEO)
+            return !ist->decoding_needed;
+    }
+    return 0;
+}
+
 void ffmpeg_monitor_set_sigterm(int v)
 {
     monitor_got_sigterm = v;
@@ -35,6 +52,8 @@ void ffmpeg_monitor_touch(void)
 
 static void *monitor_worker(void *arg)
 {
+    int copy_skip_logged = 0;
+
     (void)arg;
     pthread_detach(pthread_self());
     war("@zombine_monitor is started!(abnormal_timeout=%d s)\n", abnormal_timeout);
@@ -43,11 +62,19 @@ static void *monitor_worker(void *arg)
             last_update_time = av_gettime_relative();
         int64_t offset = av_gettime_relative() - last_update_time;
         if (offset > (int64_t)abnormal_timeout * 1000000) {
-            err("Too long[%ld>=%ds] wait for transcode loop! maybe block, force exit!\n",
-                (long)(offset / 1000000), abnormal_timeout);
-            term_exit();
-            fflush(stdout);
-            abort();
+            if (monitor_video_is_copy()) {
+                if (!copy_skip_logged) {
+                    war("stream copy: skip abnormal_timeout loop abort\n");
+                    copy_skip_logged = 1;
+                }
+                last_update_time = av_gettime_relative();
+            } else {
+                err("Too long[%ld>=%ds] wait for transcode loop! maybe block, force exit!\n",
+                    (long)(offset / 1000000), abnormal_timeout);
+                term_exit();
+                fflush(stdout);
+                abort();
+            }
         }
         av_usleep(10 * 1000);
     }
@@ -420,6 +447,8 @@ int ffmpeg_monitor_check_abort(float running_secs)
     uint64_t v10s_elements;
 
     if (!avs_poster || abnormal_timeout <= 0)
+        return 0;
+    if (monitor_video_is_copy())
         return 0;
 
     v10s_lossrate = avs_poster->ist_v_stat.p.is_coppied

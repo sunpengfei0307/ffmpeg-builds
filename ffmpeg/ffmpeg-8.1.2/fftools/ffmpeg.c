@@ -399,6 +399,16 @@ static void ffmpeg_cleanup(int ret)
 
     hw_device_free_all();
 
+    ffmpeg_http_server_uninit();
+    ffmpeg_http_live_uninit();
+    av_freep(&ffmpeg_http_server_url);
+    av_freep(&ffmpeg_http_root);
+    av_freep(&ffmpeg_http_cert);
+    av_freep(&ffmpeg_http_key);
+    av_freep(&ffmpeg_http_auth);
+    av_freep(&ffmpeg_http_token);
+    av_freep(&ffmpeg_http_allow);
+
     ffmpeg_zmq_uninit();
     av_freep(&ffmpeg_zmq_url);
 
@@ -1002,6 +1012,13 @@ static int transcode(Scheduler *sch)
 
     atomic_store(&transcode_init_done, 1);
 
+    if (ffmpeg_http_server_url && ffmpeg_http_server_url[0] && ffmpeg_http_live) {
+        ret = ffmpeg_http_live_init();
+        if (ret < 0)
+            av_log(NULL, AV_LOG_ERROR, "http-live init failed: %s\n",
+                   av_err2str(ret));
+    }
+
     ret = sch_start(sch);
     if (ret < 0)
         return ret;
@@ -1009,6 +1026,10 @@ static int transcode(Scheduler *sch)
     ret = ffmpeg_zmq_init(ffmpeg_zmq_url);
     if (ret < 0)
         av_log(NULL, AV_LOG_ERROR, "process ZMQ init failed: %s\n", av_err2str(ret));
+
+    ret = ffmpeg_http_server_init(ffmpeg_http_server_url, ffmpeg_http_root);
+    if (ret < 0)
+        av_log(NULL, AV_LOG_ERROR, "http-server init failed: %s\n", av_err2str(ret));
 
     if (stdin_interaction) {
         av_log(NULL, AV_LOG_INFO, "Press [q] to stop, [?] for help\n");
@@ -1042,6 +1063,8 @@ static int transcode(Scheduler *sch)
 
     ffmpeg_monitor_stop_report_timer();
 
+    ffmpeg_http_server_uninit();
+    ffmpeg_http_live_uninit();
     ffmpeg_zmq_uninit();
 
     ret = sch_stop(sch, &transcode_ts);

@@ -182,7 +182,7 @@ int show_colors(void *optctx, const char *opt, const char *arg);
 int opt_loglevel(void *optctx, const char *opt, const char *arg);
 
 int opt_report(void *optctx, const char *opt, const char *arg);
-int init_report(const char *env, FILE **file);
+int init_report(const char *env, FILE **file, const char *prefix);
 
 int opt_max_alloc(void *optctx, const char *opt, const char *arg);
 
@@ -222,7 +222,7 @@ int opt_cpucount(void *optctx, const char *opt, const char *arg);
     { "colors",       OPT_TYPE_FUNC, OPT_EXIT | OPT_EXPERT, { .func_arg = show_colors },      "show available color names" },            \
     { "loglevel",     OPT_TYPE_FUNC, OPT_FUNC_ARG | OPT_EXPERT, { .func_arg = opt_loglevel },     "set logging level", "loglevel" },         \
     { "v",            OPT_TYPE_FUNC, OPT_FUNC_ARG,          { .func_arg = opt_loglevel },     "set logging level", "loglevel" },         \
-    { "report",       OPT_TYPE_FUNC, OPT_EXPERT,            { .func_arg = opt_report },       "generate a report" },                     \
+    { "report",       OPT_TYPE_FUNC, OPT_FUNC_OPTARG | OPT_EXPERT, { .func_arg = opt_report }, "dump logs to prefix-YYYYMMDD-HHMMSS.log (cwd ffmpeg-%t.log if omitted)", "prefix" }, \
     { "max_alloc",    OPT_TYPE_FUNC, OPT_FUNC_ARG | OPT_EXPERT, { .func_arg = opt_max_alloc },    "set maximum size of a single allocated block", "bytes" }, \
     { "cpuflags",     OPT_TYPE_FUNC, OPT_FUNC_ARG | OPT_EXPERT, { .func_arg = opt_cpuflags },     "force specific cpu flags", "flags" },     \
     { "cpucount",     OPT_TYPE_FUNC, OPT_FUNC_ARG | OPT_EXPERT, { .func_arg = opt_cpucount },     "force specific cpu count", "count" },     \

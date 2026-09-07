@@ -405,7 +405,13 @@ int parse_option(void *optctx, const char *opt, const char *arg,
         av_log(NULL, AV_LOG_ERROR, "Unrecognized option '%s'\n", opt);
         return AVERROR(EINVAL);
     }
-    if (opt_has_arg(po) && !arg) {
+    if (po->flags & OPT_FUNC_OPTARG) {
+        if (arg && arg[0] && !(arg[0] == '-' && arg[1])) {
+            /* keep arg, consume it */
+        } else {
+            arg = "";
+        }
+    } else if (opt_has_arg(po) && !arg) {
         av_log(NULL, AV_LOG_ERROR, "Missing argument for option '%s'\n", opt);
         return AVERROR(EINVAL);
     }
@@ -414,6 +420,8 @@ int parse_option(void *optctx, const char *opt, const char *arg,
     if (ret < 0)
         return ret;
 
+    if (po->flags & OPT_FUNC_OPTARG)
+        return (arg && arg[0] && !(arg[0] == '-' && arg[1]));
     return opt_has_arg(po);
 }
 
@@ -546,8 +554,9 @@ static void check_options(const OptionDef *po)
         if (po->type == OPT_TYPE_FUNC)
             av_assert0(!(po->flags & (OPT_FLAG_OFFSET | OPT_FLAG_SPEC)));
 
-        // OPT_FUNC_ARG can only be ser for OPT_TYPE_FUNC
+        // OPT_FUNC_ARG / OPT_FUNC_OPTARG can only be set for OPT_TYPE_FUNC
         av_assert0((po->type == OPT_TYPE_FUNC) || !(po->flags & OPT_FUNC_ARG));
+        av_assert0((po->type == OPT_TYPE_FUNC) || !(po->flags & OPT_FUNC_OPTARG));
 
         po++;
     }
@@ -569,7 +578,11 @@ void parse_loglevel(int argc, char **argv, const OptionDef *options)
     env = getenv_utf8("FFREPORT");
     if (env || idx) {
         FILE *report_file = NULL;
-        init_report(env, &report_file);
+        const char *prefix = NULL;
+        if (idx && idx + 1 < argc && argv[idx + 1] &&
+            !(argv[idx + 1][0] == '-' && argv[idx + 1][1]))
+            prefix = argv[idx + 1];
+        init_report(env, &report_file, prefix);
         if (report_file) {
             int i;
             fprintf(report_file, "Command line:\n");
@@ -856,6 +869,10 @@ do {                                                                           \
                 arg = argv[optindex++];
             } else if (opt_has_arg(po)) {
                 GET_ARG(arg);
+            } else if ((po->flags & OPT_FUNC_OPTARG) &&
+                       argv[optindex] &&
+                       !(argv[optindex][0] == '-' && argv[optindex][1])) {
+                arg = argv[optindex++];
             } else {
                 arg = "1";
             }

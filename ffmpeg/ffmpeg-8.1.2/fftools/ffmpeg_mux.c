@@ -244,6 +244,9 @@ static int write_packet(Muxer *mux, OutputStream *ost, AVPacket *pkt)
     if (ms->stats.io)
         enc_stats_write(ost, &ms->stats, NULL, pkt, frame_num);
 
+    /* Clone before interleaved_write_frame takes the packet. */
+    ffmpeg_http_live_push(&mux->of, ost, pkt);
+
     ret = av_interleaved_write_frame(s, pkt);
     if (ret < 0) {
         av_log(ost, AV_LOG_ERROR,

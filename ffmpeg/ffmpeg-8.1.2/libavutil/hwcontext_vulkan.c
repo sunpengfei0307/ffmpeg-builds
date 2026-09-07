@@ -2279,6 +2279,11 @@ static int vulkan_frames_get_constraints(AVHWDeviceContext *ctx,
                                                            VK_IMAGE_TILING_OPTIMAL,
                                     NULL, NULL, NULL, NULL, p->disable_multiplane, 1) >= 0;
     }
+#if CONFIG_CUDA
+    /* NVIDIA CUDA frames can be uploaded into Vulkan (scale_cuda -> hwupload). */
+    if (p->props.properties.vendorID == 0x10de)
+        count++;
+#endif
 
     constraints->valid_sw_formats = av_malloc_array(count + 1,
                                                     sizeof(enum AVPixelFormat));
@@ -2294,7 +2299,10 @@ static int vulkan_frames_get_constraints(AVHWDeviceContext *ctx,
             constraints->valid_sw_formats[count++] = vk_formats_list[i].pixfmt;
         }
     }
-
+#if CONFIG_CUDA
+    if (p->props.properties.vendorID == 0x10de)
+        constraints->valid_sw_formats[count++] = AV_PIX_FMT_CUDA;
+#endif
     constraints->valid_sw_formats[count++] = AV_PIX_FMT_NONE;
 
     constraints->min_width  = 1;

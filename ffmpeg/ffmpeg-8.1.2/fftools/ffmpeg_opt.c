@@ -1603,6 +1603,92 @@ static int opt_zmq(void *optctx, const char *opt, const char *arg)
     return ffmpeg_zmq_url ? 0 : AVERROR(ENOMEM);
 }
 
+static int opt_http_server(void *optctx, const char *opt, const char *arg)
+{
+    (void)optctx;
+    (void)opt;
+    av_free(ffmpeg_http_server_url);
+    ffmpeg_http_server_url = av_strdup(arg);
+    return ffmpeg_http_server_url ? 0 : AVERROR(ENOMEM);
+}
+
+static int opt_http_root(void *optctx, const char *opt, const char *arg)
+{
+    (void)optctx;
+    (void)opt;
+    av_free(ffmpeg_http_root);
+    ffmpeg_http_root = av_strdup(arg);
+    return ffmpeg_http_root ? 0 : AVERROR(ENOMEM);
+}
+
+static int opt_http_strdup(char **dst, const char *arg)
+{
+    av_free(*dst);
+    *dst = av_strdup(arg ? arg : "");
+    return *dst ? 0 : AVERROR(ENOMEM);
+}
+
+static int opt_http_cert(void *optctx, const char *opt, const char *arg)
+{
+    (void)optctx;
+    (void)opt;
+    return opt_http_strdup(&ffmpeg_http_cert, arg);
+}
+
+static int opt_http_key(void *optctx, const char *opt, const char *arg)
+{
+    (void)optctx;
+    (void)opt;
+    return opt_http_strdup(&ffmpeg_http_key, arg);
+}
+
+static int opt_http_auth(void *optctx, const char *opt, const char *arg)
+{
+    (void)optctx;
+    (void)opt;
+    if (arg && strchr(arg, ':') == NULL) {
+        av_log(NULL, AV_LOG_ERROR, "http-server: -http_auth expects user:password\n");
+        return AVERROR(EINVAL);
+    }
+    return opt_http_strdup(&ffmpeg_http_auth, arg);
+}
+
+static int opt_http_token(void *optctx, const char *opt, const char *arg)
+{
+    (void)optctx;
+    (void)opt;
+    return opt_http_strdup(&ffmpeg_http_token, arg);
+}
+
+static int opt_http_allow(void *optctx, const char *opt, const char *arg)
+{
+    char *n;
+    size_t need;
+    (void)optctx;
+    (void)opt;
+    if (!arg || !arg[0])
+        return 0;
+    if (!ffmpeg_http_allow) {
+        ffmpeg_http_allow = av_strdup(arg);
+        return ffmpeg_http_allow ? 0 : AVERROR(ENOMEM);
+    }
+    need = strlen(ffmpeg_http_allow) + strlen(arg) + 2;
+    n = av_malloc(need);
+    if (!n)
+        return AVERROR(ENOMEM);
+    snprintf(n, need, "%s,%s", ffmpeg_http_allow, arg);
+    av_free(ffmpeg_http_allow);
+    ffmpeg_http_allow = n;
+    return 0;
+}
+
+static int opt_http_live_bind(void *optctx, const char *opt, const char *arg)
+{
+    (void)optctx;
+    (void)opt;
+    return ffmpeg_http_live_add_bind(arg);
+}
+
 /* Export task_id for lavfi filters (gain/cmd ipc sock) before filtergraph init. */
 static int opt_task_id(void *optctx, const char *opt, const char *arg)
 {
@@ -2263,6 +2349,40 @@ const OptionDef options[] = {
         { .func_arg = opt_zmq },
         "process-level ZMQ REP for filter/codec/format/protocol/fftools "
         "(does not replace graph zmq/azmq)", "url" },
+    { "http_server",            OPT_TYPE_FUNC, OPT_FUNC_ARG | OPT_EXPERT,
+        { .func_arg = opt_http_server },
+        "in-process HTTP/HTTPS GET for HLS/DASH files and /{app}/{stream}.flv|.ts|.mp4",
+        "url" },
+    { "http_root",              OPT_TYPE_FUNC, OPT_FUNC_ARG | OPT_EXPERT,
+        { .func_arg = opt_http_root },
+        "document root for -http_server VOD/HLS files (optional if only live GOP)",
+        "path" },
+    { "http_cert",              OPT_TYPE_FUNC, OPT_FUNC_ARG | OPT_EXPERT,
+        { .func_arg = opt_http_cert },
+        "TLS certificate PEM for -http_server https://", "path" },
+    { "http_key",               OPT_TYPE_FUNC, OPT_FUNC_ARG | OPT_EXPERT,
+        { .func_arg = opt_http_key },
+        "TLS private key PEM for -http_server https://", "path" },
+    { "http_auth",              OPT_TYPE_FUNC, OPT_FUNC_ARG | OPT_EXPERT,
+        { .func_arg = opt_http_auth },
+        "HTTP Basic user:password for pull auth", "user:password" },
+    { "http_token",             OPT_TYPE_FUNC, OPT_FUNC_ARG | OPT_EXPERT,
+        { .func_arg = opt_http_token },
+        "pull token (?token= or Authorization: Bearer)", "token" },
+    { "http_allow",             OPT_TYPE_FUNC, OPT_FUNC_ARG | OPT_EXPERT,
+        { .func_arg = opt_http_allow },
+        "client IP/CIDR whitelist (repeatable or comma-separated); empty=allow all",
+        "cidr" },
+    { "http_live",              OPT_TYPE_BOOL, OPT_EXPERT,
+        { &ffmpeg_http_live },
+        "1: memory GOP on /{app}/{stream}.flv|.ts|.mp4 (default); 0: VOD file GET only" },
+    { "http_live_bind",         OPT_TYPE_FUNC, OPT_FUNC_ARG | OPT_EXPERT,
+        { .func_arg = opt_http_live_bind },
+        "bind /app/stream to an output file (repeatable: live/ls_cctv_1080p:0)",
+        "app/stream[:index]" },
+    { "http_workers",           OPT_TYPE_INT, OPT_EXPERT,
+        { &ffmpeg_http_workers },
+        "HTTP worker threads (default 32, like a small nginx worker pool)", "n" },
     { "task_id",                OPT_TYPE_FUNC, OPT_FUNC_ARG | OPT_EXPERT,
         { .func_arg = opt_task_id },
         "ppc/pgc task id; enables status poster "

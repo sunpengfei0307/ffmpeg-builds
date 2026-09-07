@@ -1145,7 +1145,7 @@ static void log_callback_report(void *ptr, int level, const char *fmt, va_list v
     }
 }
 
-int init_report(const char *env, FILE **file)
+int init_report(const char *env, FILE **file, const char *prefix)
 {
     char *filename_template = NULL;
     char *key, *val;
@@ -1194,9 +1194,22 @@ int init_report(const char *env, FILE **file)
     }
 
     av_bprint_init(&filename, 0, AV_BPRINT_SIZE_AUTOMATIC);
-    expand_filename_template(&filename,
-                             av_x_if_null(filename_template, "%p-%t.log"), tm);
-    av_free(filename_template);
+    if (prefix && prefix[0] && strcmp(prefix, "1")) {
+        char pbuf[4096];
+        size_t plen;
+
+        av_strlcpy(pbuf, prefix, sizeof(pbuf));
+        plen = strlen(pbuf);
+        if (plen >= 4 && !av_strcasecmp(pbuf + plen - 4, ".log"))
+            pbuf[plen - 4] = 0;
+        av_bprintf(&filename, "%s-", pbuf);
+        expand_filename_template(&filename, "%t.log", tm);
+        av_free(filename_template);
+    } else {
+        expand_filename_template(&filename,
+                                 av_x_if_null(filename_template, "%p-%t.log"), tm);
+        av_free(filename_template);
+    }
     if (!av_bprint_is_complete(&filename)) {
         av_log(NULL, AV_LOG_ERROR, "Out of memory building report file name\n");
         return AVERROR(ENOMEM);
@@ -1232,7 +1245,13 @@ int init_report(const char *env, FILE **file)
 
 int opt_report(void *optctx, const char *opt, const char *arg)
 {
-    return init_report(NULL, NULL);
+    const char *prefix = NULL;
+
+    (void)optctx;
+    (void)opt;
+    if (arg && arg[0] && strcmp(arg, "1") && !(arg[0] == '-' && arg[1]))
+        prefix = arg;
+    return init_report(NULL, NULL, prefix);
 }
 
 int opt_max_alloc(void *optctx, const char *opt, const char *arg)

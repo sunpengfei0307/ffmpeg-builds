@@ -19,7 +19,10 @@
 | `detect_cuda` | [detect_cuda.md](./detect_cuda.md) |
 | `tonemap_cuda` | [tonemap_cuda.md](./tonemap_cuda.md) |
 | `hlg2pq_cuda` | [hlg2pq_cuda.md](./hlg2pq_cuda.md) |
+| libplacebo HDR→SDR（`scale_cuda` + Vulkan `hwupload`） | [libplacebo.md](./libplacebo.md) |
 | 进程级 `-zmq`（滤镜增删改查、nvenc 码率、concat 切源、ffmpeg 退出） | [zmq.md](./zmq.md) |
+| 进程内 HTTP 拉流（`-http_server`：HLS / DASH / `/{app}/{stream}.flv\|ts\|mp4` 内存 GOP） | [http_server.md](./http_server.md) |
+| `-report` 写启动日志文件（前缀-日期时间.log） | [report.md](./report.md) |
 
 合屏设计规格（可选深入）：[superpowers/specs/](./superpowers/specs/)
 

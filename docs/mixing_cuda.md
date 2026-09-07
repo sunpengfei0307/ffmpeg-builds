@@ -7,6 +7,16 @@
 
 | 日期  | 说明  |
 | --- | --- |
+| 2026-09-07 | `-abnormal_timeout` 对视频 stream copy 不杀进程（无解码帧可判） |
+| 2026-09-02 | `-report 前缀` 按启动时间写独立日志文件，见 [report.md](./report.md) |
+| 2026-09-02 | HTTP 白名单拒绝回 403（不再静默断连），见 [http_server.md](./http_server.md) |
+| 2026-09-02 | HTTP 操作/异常日志带 `([时间]` 前缀，见 [http_server.md](./http_server.md) |
+| 2026-09-02 | HTTP-FLV/MP4 剥 AAC ADTS，见 [http_server.md](./http_server.md) |
+| 2026-09-02 | HTTP-TS 裸 AAC 补 ASC extra，见 [http_server.md](./http_server.md) |
+| 2026-09-02 | HTTP-FLV/MP4 Annex B→AVCC，见 [http_server.md](./http_server.md) |
+| 2026-09-02 | HTTP 起播不等 extradata；connect/disconnect 成对日志，见 [http_server.md](./http_server.md) |
+| 2026-09-02 | HTTP 拉流 accept/起播加速（`req=`/`wait=` 日志），见 [http_server.md](./http_server.md) |
+| 2026-09-02 | `-http_live_bind` 多输出绑定；`?lowdelay=1`；HLS/DASH 不受 `-http_live` 影响，见 [http_server.md](./http_server.md) |
 | 2026-08-20 | 图内 `zmq` 可选：有 `-zmq` 即可给所有滤镜发命令；全量命令手册见 [zmq.md](./zmq.md) |
 | 2026-08-19 | 新版启动：图内 `123456_filter.sock` + 进程 `-zmq` `123456_cmd.sock`；§3.6 / §7 示例同步 |
 | 2026-08-17 | 进程级 `-zmq` 与图内 zmq/azmq 并存，合屏命令仍走图内 sock，见 [zmq.md](./zmq.md) |
@@ -81,6 +91,7 @@ FFMPEG_ONLY=1 ./build.sh
 
 ```text
 ./ffmpeg -task_id 123456 \
+  -report /data/LCMS/log/123456_mix \
   -zmq ipc:///data/LCMS/sock/123456_cmd.sock \
   -init_hw_device cuda=hw:0 -filter_hw_device hw \
   -filter_complex "
@@ -223,6 +234,30 @@ URL="rtmp://test-push.live.qiyi.domain/live/ls_src_zp_h264_1080p"
 ./asr_cmd "ffmpeg loglevel warning" "$CMD_SOCK"
 ./asr_cmd "ffmpeg quit" "$CMD_SOCK"
 ```
+
+
+
+### 3.7 可选：进程内 HTTP 预览（不替代 RTMP）
+
+主输出仍是 §3.6 的 `flv`/`rtmp`。加 `-http_server` 即可拉 `/{app}/{stream}.flv`（无 bind 时默认 `/live/live.flv`）。自定义流名用 `-http_live_bind live/stream_out:0`。需要浏览器 HLS 时再加第二路 `-f hls`。HTTPS/鉴权见 [http_server.md](./http_server.md) §1.4 / §2 / §3。
+
+```bash
+./ffmpeg -task_id 123456 \
+  -zmq ipc:///data/LCMS/sock/123456_cmd.sock \
+  -http_server http://0.0.0.0:8080 \
+  -http_root /data/LCMS/hls/123456 \
+  ... 同上 filter_complex / map / nvenc / aac ... \
+  -f flv rtmp://test-push.live.qiyi.domain/live/stream_out \
+  -map '[vout]' -map '[aout]' \
+  -c:v h264_nvenc -preset p4 -b:v 2500k \
+  -c:a aac \
+  -f hls -hls_time 2 -hls_list_size 8 \
+    -hls_flags delete_segments+independent_segments \
+    -hls_segment_type fmp4 \
+    /data/LCMS/hls/123456/index.m3u8
+```
+
+拉流：`http://host:8080/live/live.flv`（主路 GOP；`?lowdelay=1` 等下一 I）、`http://host:8080/index.m3u8`（HLS，不受 `-http_live` 影响）。多码率用 `-http_live_bind live/name:N`。
 
 
 
@@ -891,7 +926,7 @@ CMD_SOCK="ipc:///data/LCMS/sock/123456_cmd.sock"
 | RTMP 未恢复                              | 视频 `lavfi.dyn_empty` 占位；音频不推占位（amixrank 空 FIFO=静音）；不发 EOF，可重连                                                                                                                     |
 | 断流/重连后一路画面冻住                          | 见附录 **B.3**；持帧勿再被当成 live（`lavfi.dyn_hold`）                                                                                                                                        |
 | update 换源无淡入/滑入/飞入                    | 见附录 **B.7**；查 `content_gen`/`tile transition start` 日志；同 URL `unchanged` 不播；旧二进制误绑每帧 `cur_seq` 会导致特效永远 t≈0                                                                        |
-| `initial_urls` 打开失败 / 只开一路            | shell + filtergraph 双重转义不足，见附录 **B.5**                                                                                                                                            |
+| `-c copy` 却被 `-abnormal_timeout` 杀掉 | 旧版本按解码帧/循环卡住杀 copy。现对视频 stream copy 跳过僵尸超时和 10s 丢帧退出；转码任务仍生效 |
 
 
 其它：

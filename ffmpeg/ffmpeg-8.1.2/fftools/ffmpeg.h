@@ -1018,6 +1018,36 @@ int encoder_thread(void *arg);
 extern char *ffmpeg_zmq_url;
 int  ffmpeg_zmq_init(const char *url);
 void ffmpeg_zmq_uninit(void);
+
+/* process-level HTTP GET file server for HLS/DASH + memory GOP live */
+extern char *ffmpeg_http_server_url;
+extern char *ffmpeg_http_root;
+extern char *ffmpeg_http_cert;
+extern char *ffmpeg_http_key;
+extern char *ffmpeg_http_auth;
+extern char *ffmpeg_http_token;
+extern char *ffmpeg_http_allow;
+extern int   ffmpeg_http_live;
+extern int   ffmpeg_http_workers;
+int  ffmpeg_http_server_init(const char *url, const char *root);
+void ffmpeg_http_server_uninit(void);
+void ffmpeg_http_log(int level, const char *fmt, ...) av_printf_format(2, 3);
+int  ffmpeg_http_conn_write(void *conn, const uint8_t *buf, int len);
+const char *ffmpeg_http_conn_peer(void *conn);
+void ffmpeg_http_conn_note(void *conn, const char *reason);
+int64_t ffmpeg_http_conn_bytes(void *conn);
+int  ffmpeg_http_live_init(void);
+void ffmpeg_http_live_shutdown(void);
+void ffmpeg_http_live_uninit(void);
+void ffmpeg_http_live_push(const OutputFile *of, const OutputStream *ost,
+                           const AVPacket *pkt);
+int  ffmpeg_http_live_enabled(void);
+int  ffmpeg_http_live_add_bind(const char *arg);
+int  ffmpeg_http_live_match(const char *path, const char **fmt, const char **mime,
+                           int *lowdelay, int *pub_idx);
+int  ffmpeg_http_live_serve(void *http_conn, const char *fmt,
+                            const char *mime, int head_only,
+                            int pub_idx, int lowdelay, int64_t accept_us);
 int  ffmpeg_zmq_dispatch(const char *line, char *res, int res_len);
 int  ffmpeg_process_command(const char *cmd, const char *arg, char *res, int res_len);
 void ffmpeg_request_quit(void);
