@@ -1,0 +1,137 @@
+# mixing_cuda + concat try_self usage
+
+## Layout JSON example (`layout.json`)
+
+```json
+{
+  "canvas": { "w": 1920, "h": 1080 },
+  "bg": "#101010",
+  "on_disconnect": "collapse",
+  "videos": [
+    { "input": 0, "x": 0, "y": 0, "w": 50, "h": 50, "z": 0, "visible": 1 },
+    { "input": 1, "x": 50, "y": 0, "w": 50, "h": 50, "z": 0, "visible": 1 },
+    { "input": 2, "x": 0, "y": 50, "w": 50, "h": 50, "z": 0, "visible": 1 },
+    { "input": 3, "x": 50, "y": 50, "w": 50, "h": 50, "z": 0, "visible": 1 }
+  ],
+  "audios": [
+    { "input": 0, "weight": 1 },
+    { "input": 1, "weight": 0 },
+    { "input": 2, "weight": 0 },
+    { "input": 3, "weight": 0 }
+  ]
+}
+```
+
+## Filtergraph (1 main + 3 sub, 8 pads reserved)
+
+Unused pads reuse `color_cuda` / `anullsrc` so the graph never EOFs.
+
+```text
+color_cuda=c=0x101010:s=1920x1080:r=25[bg];
+[bg][0:v][1:v][2:v][3:v][bg][bg][bg][bg]mixing_cuda=inputs=8:s=1920x1080:format=nv12:layout_file=/tmp/layout.json:on_disconnect=collapse[vout];
+anullsrc=r=48000:cl=stereo[asil];
+[asil][0:a][1:a][2:a][3:a][asil][asil][asil]amix=inputs=8:weights=1 0 0 0 0 0 0 0:normalize=0[aout]
+```
+
+No per-input `scale_cuda` is required: `mixing_cuda` scales each input into its slot.
+
+## Per-input concat self-heal
+
+```text
+-f concat -try_self 1 -concat_cmd ipc:///tmp/concat0.sock -i rtmp://main0
+```
+
+- `try_self=1`: on read failure/EOF, bypass-probe the same URL every 3s; process keeps running.
+- Hot switch backup: ZMQ REP command `concat src rtmp://backup0`
+- After reconnect, frames resume and `mixing_cuda` fills the slot / restores layout.
+
+## Runtime layout update
+
+Via filter `zmq` / `sendcmd`:
+
+```text
+mixing_cuda layout {"canvas":{"w":1920,"h":1080},"videos":[...],...}
+mixing_cuda reload
+```
+
+Or edit `layout_file` on disk (size-change triggers reload).
+
+## Audio
+
+`amix` with a single non-zero weight passthroughs that input (no MAC mix).
+Weight `0` skips mixing for that input.
+
+---
+
+# Real-time meeting compositing (vf_dynamic_input + mixing_cuda + amixrank)
+
+Three cooperating filters form an OBS-style live meeting compositor:
+
+- `vf_dynamic_input` — multi-source CUDA video source (outputs=16 pads, per-stream
+  RTMP pull + CUDA hwdec, runtime add/remove/switch/clear via zmq or sendcmd).
+- `mixing_cuda` — video compositor with three layout modes (adaptive/fixed/speaker),
+  logical activate/deactivate, zmq SUB loudness-driven speaker switching, CUevent
+  pipeline, and FrameSync anti-blocking sync strategy.
+- `af_amixrank` — audio mixer with per-input loudness measurement, ranking, zmq PUB
+  publish, and ducking (loudest full volume, others attenuated).
+
+## End-to-end filtergraph
+
+```text
+-init_hw_device cuda=hw -filter_hw_device hw
+color_cuda=c=0x101010:s=1920x1080:r=25[bg];
+vf_dynamic_input=outputs=16:device=hw:sw_format=nv12:s=1920x1080:r=25:initial_urls=rtmp://u0,rtmp://u1[v0][v1][v2][v3][v4][v5][v6][v7][v8][v9][v10][v11][v12][v13][v14][v15];
+[bg][v0][v1][v2][v3][v4][v5][v6][v7][v8][v9][v10][v11][v12][v13][v14][v15]mixing_cuda=inputs=16:s=1920x1080:layout_mode=speaker:rank_endpoint=tcp://127.0.0.1:5556:speaker_layout=obs:primary_input=0:speaker_hold_ms=500:speaker_switch_db=6[vout]
+anullsrc=r=48000:cl=stereo[asil];
+[asil][0:a][1:a][2:a][3:a][4:a][5:a][6:a][7:a][8:a][9:a][10:a][11:a][12:a][13:a][14:a][15:a]amixrank=inputs=16:rank_endpoint=tcp://127.0.0.1:5556:ducking=1:duck_gain_db=-18:rank_interval_ms=100[aout]
+```
+
+## Runtime commands (zmq / sendcmd)
+
+### vf_dynamic_input
+
+```text
+add rtmp://newuser          # open in first free slot
+remove rtmp://user          # close that source
+switch 2 rtmp://backup      # replace slot 2's url
+clear                       # close all sources
+list                        # query current sources
+set_active 3 0              # logically deactivate slot 3 (renders fill)
+set_active 3 1              # re-activate slot 3
+```
+
+### mixing_cuda
+
+```text
+set_active 3 0              # deactivate input 3 (renders fill, anull)
+set_active 3 1              # re-activate
+active_speaker 2            # manually set main speaker
+speaker_layout obs          # OBS-style: speaker 70% + thumbnails
+speaker_layout grid         # grid-style: speaker largest cell
+layout_mode adaptive        # auto 1~9 grid by active count
+layout_mode fixed           # JSON layout
+layout_mode speaker         # zmq-driven speaker layout
+```
+
+## Ducking (amixrank)
+
+- `ducking=1` enables ducking: the loudest input (rank[0]) plays at full volume;
+  all others are attenuated by `duck_gain_db` (default -18 dB).
+- `dropout_transition` smooths volume transitions when inputs drop out.
+- `rank_endpoint` binds a zmq PUB socket; mixing_cuda connects as SUB to receive
+  the rank JSON `{"rank":[2,0,1],"levels":[-20,-35,-40]}` every `rank_interval_ms`.
+
+## FrameSync anti-blocking
+
+mixing_cuda sets:
+- primary input (default 0): `sync=1, before=EXT_STOP, after=EXT_INFINITY`
+- all other inputs: `sync=0, before=EXT_NULL, after=EXT_INFINITY, eof=repeat`
+
+This means a stalled or missing secondary input never blocks output — the slot
+renders fill color instead. Only the primary input drives the output clock.
+
+## CUevent pipeline
+
+Instead of `cuStreamSynchronize` every frame (blocking CPU), mixing_cuda records
+a CUevent after compose and waits on that event at the start of the next compose.
+Input frame references are held until the event completes.
