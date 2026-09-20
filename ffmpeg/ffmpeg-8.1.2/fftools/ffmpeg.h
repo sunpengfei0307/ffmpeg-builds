@@ -1036,6 +1036,11 @@ int  ffmpeg_http_conn_write(void *conn, const uint8_t *buf, int len);
 const char *ffmpeg_http_conn_peer(void *conn);
 void ffmpeg_http_conn_note(void *conn, const char *reason);
 int64_t ffmpeg_http_conn_bytes(void *conn);
+int  ffmpeg_http_conn_worker_id(void *conn);
+void ffmpeg_http_conn_wait_msg(void *conn);
+int  ffmpeg_http_conn_got_msg(void *conn, int *type, int *pub_idx, int *fmt_idx);
+void ffmpeg_http_conn_mark_live(void *conn, int pub_idx);
+int  ffmpeg_http_conn_kicked(void *conn);
 int  ffmpeg_http_live_init(void);
 void ffmpeg_http_live_shutdown(void);
 void ffmpeg_http_live_uninit(void);
@@ -1048,6 +1053,8 @@ int  ffmpeg_http_live_match(const char *path, const char **fmt, const char **mim
 int  ffmpeg_http_live_serve(void *http_conn, const char *fmt,
                             const char *mime, int head_only,
                             int pub_idx, int lowdelay, int64_t accept_us);
+int  ffmpeg_http_live_stat_json(char **out);
+int  ffmpeg_http_live_kick(const char *spec, int all, char **out);
 int  ffmpeg_zmq_dispatch(const char *line, char *res, int res_len);
 int  ffmpeg_process_command(const char *cmd, const char *arg, char *res, int res_len);
 void ffmpeg_request_quit(void);

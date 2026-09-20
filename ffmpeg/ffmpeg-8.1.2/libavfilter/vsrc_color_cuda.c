@@ -17,6 +17,7 @@
 #include "libavutil/imgutils.h"
 #include "libavutil/opt.h"
 #include "libavutil/pixdesc.h"
+#include "libavutil/time.h"
 
 #include "avfilter.h"
 #include "colorspace.h"
@@ -72,6 +73,8 @@ typedef struct ColorCudaContext {
     int64_t duration;
     int64_t pts;
     unsigned int nb_frame;
+    int re;
+    int64_t pace_start_us;
 
     enum AVPixelFormat sw_format;
     enum AVColorSpace   eff_csp;
@@ -326,6 +329,7 @@ static av_cold int color_cuda_init(AVFilterContext *ctx)
     s->time_base = av_inv_q(s->frame_rate);
     s->nb_frame = 0;
     s->pts = 0;
+    s->pace_start_us = 0;
     s->draw_once_reset = 0;
 
     av_log(ctx, AV_LOG_VERBOSE, "size:%dx%d rate:%d/%d duration:%f sar:%d/%d\n",
@@ -440,6 +444,7 @@ static int color_cuda_config_props(AVFilterLink *outlink)
     s->time_base = av_inv_q(s->frame_rate);
     s->nb_frame = 0;
     s->pts = 0;
+    s->pace_start_us = 0;
 
     outlink->w = s->w;
     outlink->h = s->h;
@@ -455,6 +460,21 @@ static int color_cuda_config_props(AVFilterLink *outlink)
     return 0;
 }
 
+static void color_cuda_pace(ColorCudaContext *s)
+{
+    int64_t now, due, delay;
+
+    if (!s->re)
+        return;
+    now = av_gettime_relative();
+    if (s->pace_start_us <= 0)
+        s->pace_start_us = now;
+    due = s->pace_start_us + av_rescale_q(s->pts, s->time_base, AV_TIME_BASE_Q);
+    delay = due - now;
+    if (delay > 0)
+        av_usleep(delay > 1000000 ? 1000000 : delay);
+}
+
 static int color_cuda_activate(AVFilterContext *ctx)
 {
     ColorCudaContext *s = ctx->priv;
@@ -464,6 +484,8 @@ static int color_cuda_activate(AVFilterContext *ctx)
 
     if (!ff_outlink_frame_wanted(outlink))
         return FFERROR_NOT_READY;
+
+    color_cuda_pace(s);
 
     if (s->duration >= 0 &&
         av_rescale_q(s->pts, s->time_base, AV_TIME_BASE_Q) >= s->duration) {
@@ -548,6 +570,9 @@ static const AVOption color_cuda_options[] = {
 
     { "rate", "set video rate", OFFSET(frame_rate), AV_OPT_TYPE_VIDEO_RATE, { .str = "60" }, 0, INT_MAX, FLAGS },
     { "r",    "set video rate", OFFSET(frame_rate), AV_OPT_TYPE_VIDEO_RATE, { .str = "60" }, 0, INT_MAX, FLAGS },
+
+    { "re", "pace output to r (1=realtime, 0=as fast as possible)", OFFSET(re),
+      AV_OPT_TYPE_BOOL, { .i64 = 1 }, 0, 1, FLAGS },
 
     { "duration", "set video duration", OFFSET(duration), AV_OPT_TYPE_DURATION, { .i64 = -1 }, -1, INT64_MAX, FLAGS },
     { "d",        "set video duration", OFFSET(duration), AV_OPT_TYPE_DURATION, { .i64 = -1 }, -1, INT64_MAX, FLAGS },

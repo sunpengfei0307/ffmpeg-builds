@@ -24,6 +24,9 @@ OBJS-ffmpeg +=                  \
     fftools/ffmpeg_zmq.o        \
     fftools/ffmpeg_http_server.o \
     fftools/ffmpeg_http_live.o \
+    fftools/ffmpeg_http_ev.o \
+    fftools/ffmpeg_http_co.o \
+    fftools/ffmpeg_http_ring.o \
     fftools/ffmpeg_sched.o      \
     fftools/ffmpeg_sei.o        \
     fftools/yyjson.o            \

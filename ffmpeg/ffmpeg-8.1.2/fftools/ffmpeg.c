@@ -207,6 +207,27 @@ int ffmpeg_process_command(const char *cmd, const char *arg, char *res, int res_
             snprintf(res, res_len, "loglevel=%d", av_log_get_level());
         return 0;
     }
+    if (!strcmp(cmd, "streams") || !strcmp(cmd, "stat")) {
+        char *json = NULL;
+        int ret = ffmpeg_http_live_stat_json(&json);
+        if (ret < 0)
+            return ret;
+        if (res && json)
+            av_strlcpy(res, json, res_len);
+        av_freep(&json);
+        return 0;
+    }
+    if (!strcmp(cmd, "kick")) {
+        char *json = NULL;
+        int all = !arg[0] || !strcmp(arg, "all") || !strcmp(arg, "*");
+        int ret = ffmpeg_http_live_kick(arg, all, &json);
+        if (ret < 0)
+            return ret;
+        if (res && json)
+            av_strlcpy(res, json, res_len);
+        av_freep(&json);
+        return 0;
+    }
     return AVERROR(ENOSYS);
 }
 

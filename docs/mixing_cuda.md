@@ -1,12 +1,13 @@
 ﻿# mixing_cuda（OBS 式会议合屏）
 
-三层职责：动态源（`[dynamic_input](./dynamic_input.md)`）、视频合屏（`mixing_cuda`）、音频混音（`[amixrank](./amixrank.md)`）；底板常用 `[color_cuda](./color_cuda.md)`、anullsrc。
+三层职责：动态源（`[dynamic_input](./dynamic_input.md)`）、视频合屏（`mixing_cuda`）、音频混音（`[amixrank](./amixrank.md)`）；底板常用 `[color_cuda](./color_cuda.md)` / `[clock_cuda](./clock_cuda.md)`、anullsrc。
 
 ### 变更记录
 
 
 | 日期  | 说明  |
 | --- | --- |
+| 2026-09-18 | 可用 `clock_cuda` 作 CUDA 页面时钟底板（日期/仅时间/指针钟），见 [clock_cuda.md](./clock_cuda.md) |
 | 2026-09-07 | `-abnormal_timeout` 对视频 stream copy 不杀进程（无解码帧可判） |
 | 2026-09-02 | `-report 前缀` 按启动时间写独立日志文件，见 [report.md](./report.md) |
 | 2026-09-02 | HTTP 白名单拒绝回 403（不再静默断连），见 [http_server.md](./http_server.md) |

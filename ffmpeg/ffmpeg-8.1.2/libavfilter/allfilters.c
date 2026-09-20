@@ -582,6 +582,7 @@ extern const FFFilter ff_vsrc_amf_capture;
 extern const FFFilter ff_vsrc_cellauto;
 extern const FFFilter ff_vsrc_color;
 extern const FFFilter ff_vsrc_color_cuda;
+extern const FFFilter ff_vsrc_clock_cuda;
 extern const FFFilter ff_vsrc_color_vulkan;
 extern const FFFilter ff_vsrc_colorchart;
 extern const FFFilter ff_vsrc_colorspectrum;

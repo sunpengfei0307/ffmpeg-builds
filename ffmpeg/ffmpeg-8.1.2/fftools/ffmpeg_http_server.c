@@ -2,13 +2,14 @@
  * Process-level HTTP/HTTPS GET: HLS/DASH/VOD files + /{app}/{stream}.flv|.ts|.mp4
  * from the memory GOP publisher (see ffmpeg_http_live.c).
  *
- * Accept thread + bounded worker pool (nginx-style workers, ZMQ-style HWM).
- * Optional TLS via OpenSSL on the accepted TCP fd. Pull auth + IP whitelist.
+ * Per-core EventWorker + per-connection coroutine (ZLM-style).
+ * Optional TLS via OpenSSL. Pull auth + IP whitelist.
  */
 
 #include "config.h"
 
 #include "ffmpeg.h"
+#include "ffmpeg_http_ev.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -29,12 +30,16 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <fcntl.h>
+#include <sys/sendfile.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <unistd.h>
 #define http_mkdir(path) mkdir((path), 0755)
 #endif
 
+#include "libavutil/attributes.h"
 #include "libavutil/avstring.h"
 #include "libavutil/base64.h"
 #include "libavutil/common.h"
@@ -45,10 +50,15 @@
 #include "libavutil/time.h"
 
 #include "libavformat/avformat.h"
-#include "libavformat/url.h"
 
 #if CONFIG_OPENSSL
+/* tgmath.h (via ffmpeg.h → header.h) defines I as _Complex_I;
+ * OpenSSL rsa.h uses parameter name I. */
+#ifdef I
+#undef I
+#endif
 #include <openssl/err.h>
+#include <openssl/opensslv.h>
 #include <openssl/ssl.h>
 #endif
 
@@ -87,26 +97,9 @@ char *ffmpeg_http_key;
 char *ffmpeg_http_auth;
 char *ffmpeg_http_token;
 char *ffmpeg_http_allow;
-int   ffmpeg_http_workers = 32;
+int   ffmpeg_http_workers; /* 0 = nproc EventWorkers */
 
-#define HTTP_JOB_HWM        128
-#define HTTP_LISTEN_BACKLOG 512
 #define HTTP_SNDBUF         (256 * 1024)
-
-typedef struct HttpConn {
-    URLContext *tcp;
-    int fd;
-    char peer[80];
-    char peer_ip[64];
-    int family;
-    uint8_t addr[16];
-    int64_t t0;
-    int64_t bytes_out;
-    char close_reason[80];
-#if CONFIG_OPENSSL
-    SSL *ssl;
-#endif
-} HttpConn;
 
 typedef struct HttpNet {
     int family;
@@ -115,27 +108,17 @@ typedef struct HttpNet {
 } HttpNet;
 
 static atomic_int http_running;
-static atomic_int http_clients;
-static pthread_t http_accept_th;
-static pthread_t *http_workers;
-static int http_nb_workers;
 static int http_thread_started;
-static URLContext *http_listen;
 static char *http_root_abs;
 static int http_use_tls;
 static HttpNet *http_nets;
 static int http_nb_nets;
 
-static HttpConn *http_jobq[HTTP_JOB_HWM];
-static int http_q_head, http_q_tail, http_q_count;
-static pthread_mutex_t http_q_mu = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t  http_q_cv = PTHREAD_COND_INITIALIZER;
-
 #if CONFIG_OPENSSL
 static SSL_CTX *http_ssl_ctx;
 #endif
 
-static void http_trace(const HttpConn *c, int level, const char *fmt, ...)
+static void http_trace(const HttpSession *c, int level, const char *fmt, ...)
 {
     char msg[640];
     va_list ap;
@@ -150,13 +133,13 @@ static void http_trace(const HttpConn *c, int level, const char *fmt, ...)
 
 const char *ffmpeg_http_conn_peer(void *conn)
 {
-    HttpConn *c = conn;
+    HttpSession *c = conn;
     return (c && c->peer[0]) ? c->peer : "-";
 }
 
 void ffmpeg_http_conn_note(void *conn, const char *reason)
 {
-    HttpConn *c = conn;
+    HttpSession *c = conn;
     if (!c || !reason || !reason[0])
         return;
     av_strlcpy(c->close_reason, reason, sizeof(c->close_reason));
@@ -164,8 +147,50 @@ void ffmpeg_http_conn_note(void *conn, const char *reason)
 
 int64_t ffmpeg_http_conn_bytes(void *conn)
 {
-    HttpConn *c = conn;
+    HttpSession *c = conn;
     return c ? c->bytes_out : 0;
+}
+
+int ffmpeg_http_conn_worker_id(void *conn)
+{
+    HttpSession *c = conn;
+    return (c && c->w) ? http_ev_worker_id(c->w) : -1;
+}
+
+void ffmpeg_http_conn_wait_msg(void *conn)
+{
+    if (conn)
+        http_ev_session_wait_msg(conn);
+}
+
+int ffmpeg_http_conn_got_msg(void *conn, int *type, int *pub_idx, int *fmt_idx)
+{
+    HttpEvMsg m;
+
+    if (!http_ev_session_got_msg(conn, &m))
+        return 0;
+    if (type)
+        *type = m.type;
+    if (pub_idx)
+        *pub_idx = m.pub_idx;
+    if (fmt_idx)
+        *fmt_idx = m.fmt_idx;
+    return 1;
+}
+
+void ffmpeg_http_conn_mark_live(void *conn, int pub_idx)
+{
+    HttpSession *c = conn;
+
+    if (c)
+        c->live_pub = pub_idx;
+}
+
+int ffmpeg_http_conn_kicked(void *conn)
+{
+    HttpSession *c = conn;
+
+    return c && c->kick;
 }
 
 static int http_mkdir_p(const char *path)
@@ -460,7 +485,7 @@ static int parse_allow_list(const char *s)
     return 0;
 }
 
-static int allow_match(const HttpConn *c)
+static int allow_match(const HttpSession *c)
 {
     int i, nbytes;
 
@@ -484,7 +509,7 @@ static int allow_match(const HttpConn *c)
     return 0;
 }
 
-static void http_fill_peer(HttpConn *c)
+static void http_fill_peer(HttpSession *c)
 {
     struct sockaddr_storage ss;
     socklen_t slen = sizeof(ss);
@@ -534,31 +559,21 @@ static void http_fill_peer(HttpConn *c)
     snprintf(c->peer, sizeof(c->peer), "%s:%d", host, port);
 }
 
-static void http_sock_tune(int fd, int nonblock_url, URLContext *uc)
-{
-    int one = 1;
-    int snd = HTTP_SNDBUF;
+#ifdef _WIN32
+#define http_wouldblock() (WSAGetLastError() == WSAEWOULDBLOCK)
+#else
+#define http_wouldblock() (errno == EAGAIN || errno == EWOULDBLOCK)
+#endif
 
-    if (fd < 0)
-        return;
-    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (const char *)&one, sizeof(one));
-    setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, (const char *)&one, sizeof(one));
-    setsockopt(fd, SOL_SOCKET, SO_SNDBUF, (const char *)&snd, sizeof(snd));
-#ifndef _WIN32
-#ifdef TCP_QUICKACK
-    setsockopt(fd, IPPROTO_TCP, TCP_QUICKACK, &one, sizeof(one));
-#endif
-#endif
-    if (uc) {
-        uc->rw_timeout = 2000000;
-        if (nonblock_url)
-            uc->flags |= AVIO_FLAG_NONBLOCK;
-    }
+#if CONFIG_OPENSSL
+static SSL *sess_ssl(HttpSession *c)
+{
+    return c ? (SSL *)c->ssl : NULL;
 }
+#endif
 
-static void http_conn_free(HttpConn **pc)
+static void http_session_cleanup(HttpSession *c)
 {
-    HttpConn *c = pc ? *pc : NULL;
     if (!c)
         return;
     http_trace(c, AV_LOG_INFO, "disconnect reason=%s bytes=%"PRId64,
@@ -566,32 +581,34 @@ static void http_conn_free(HttpConn **pc)
                c->bytes_out);
 #if CONFIG_OPENSSL
     if (c->ssl) {
-        SSL_shutdown(c->ssl);
-        SSL_free(c->ssl);
+        SSL_shutdown((SSL *)c->ssl);
+        SSL_free((SSL *)c->ssl);
         c->ssl = NULL;
     }
 #endif
-    ffurl_closep(&c->tcp);
-    av_free(c);
-    if (pc)
-        *pc = NULL;
 }
 
 int ffmpeg_http_conn_write(void *conn, const uint8_t *buf, int len)
 {
-    HttpConn *c = conn;
+    HttpSession *c = conn;
     int off = 0, ret;
 
     if (!c || !buf || len <= 0)
         return AVERROR(EINVAL);
     while (off < len) {
+        if (c->kick)
+            return AVERROR(EPIPE);
 #if CONFIG_OPENSSL
         if (c->ssl) {
-            ret = SSL_write(c->ssl, buf + off, len - off);
+            ret = SSL_write(sess_ssl(c), buf + off, len - off);
             if (ret <= 0) {
-                int err = SSL_get_error(c->ssl, ret);
-                if (err == SSL_ERROR_WANT_WRITE || err == SSL_ERROR_WANT_READ) {
-                    av_usleep(1000);
+                int err = SSL_get_error(sess_ssl(c), ret);
+                if (err == SSL_ERROR_WANT_WRITE) {
+                    http_ev_session_wait_fd(c, HTTP_EV_OUT);
+                    continue;
+                }
+                if (err == SSL_ERROR_WANT_READ) {
+                    http_ev_session_wait_fd(c, HTTP_EV_IN);
                     continue;
                 }
                 return AVERROR(EIO);
@@ -600,22 +617,28 @@ int ffmpeg_http_conn_write(void *conn, const uint8_t *buf, int len)
             continue;
         }
 #endif
-        if (!c->tcp)
+        if (c->fd < 0)
             return AVERROR(EIO);
-        ret = ffurl_write(c->tcp, buf + off, len - off);
-        if (ret == AVERROR(EAGAIN)) {
-            av_usleep(1000);
+#ifdef _WIN32
+        ret = send(c->fd, (const char *)buf + off, len - off, 0);
+#else
+        ret = (int)send(c->fd, buf + off, (size_t)(len - off), MSG_NOSIGNAL);
+#endif
+        if (ret > 0) {
+            off += ret;
             continue;
         }
-        if (ret < 0)
-            return ret;
-        off += ret;
+        if (ret < 0 && http_wouldblock()) {
+            http_ev_session_wait_fd(c, HTTP_EV_OUT);
+            continue;
+        }
+        return AVERROR(EIO);
     }
     c->bytes_out += len;
     return 0;
 }
 
-static int http_conn_read(HttpConn *c, unsigned char *buf, int len)
+static int http_conn_read(HttpSession *c, unsigned char *buf, int len)
 {
     int ret;
 
@@ -623,28 +646,47 @@ static int http_conn_read(HttpConn *c, unsigned char *buf, int len)
         return AVERROR(EINVAL);
 #if CONFIG_OPENSSL
     if (c->ssl) {
-        ret = SSL_read(c->ssl, buf, len);
+        ret = SSL_read(sess_ssl(c), buf, len);
         if (ret > 0)
             return ret;
         if (ret == 0)
             return AVERROR_EOF;
-        ret = SSL_get_error(c->ssl, ret);
-        if (ret == SSL_ERROR_WANT_READ || ret == SSL_ERROR_WANT_WRITE)
+        ret = SSL_get_error(sess_ssl(c), ret);
+        if (ret == SSL_ERROR_WANT_READ) {
+            http_ev_session_wait_fd(c, HTTP_EV_IN);
             return AVERROR(EAGAIN);
+        }
+        if (ret == SSL_ERROR_WANT_WRITE) {
+            http_ev_session_wait_fd(c, HTTP_EV_OUT);
+            return AVERROR(EAGAIN);
+        }
         return AVERROR(EIO);
     }
 #endif
-    if (!c->tcp)
+    if (c->fd < 0)
         return AVERROR(EIO);
-    return ffurl_read(c->tcp, buf, len);
+#ifdef _WIN32
+    ret = recv(c->fd, (char *)buf, len, 0);
+#else
+    ret = (int)recv(c->fd, buf, (size_t)len, 0);
+#endif
+    if (ret > 0)
+        return ret;
+    if (ret == 0)
+        return AVERROR_EOF;
+    if (http_wouldblock()) {
+        http_ev_session_wait_fd(c, HTTP_EV_IN);
+        return AVERROR(EAGAIN);
+    }
+    return AVERROR(EIO);
 }
 
-static int write_all(HttpConn *c, const char *buf, int len)
+static int write_all(HttpSession *c, const char *buf, int len)
 {
     return ffmpeg_http_conn_write(c, (const uint8_t *)buf, len);
 }
 
-static int send_status(HttpConn *c, int code, const char *text)
+static int send_status(HttpSession *c, int code, const char *text)
 {
     char hdr[768];
     const char *reason = text;
@@ -663,7 +705,7 @@ static int send_status(HttpConn *c, int code, const char *text)
                  "HTTP/1.1 %d %s\r\n"
                  "Access-Control-Allow-Origin: *\r\n"
                  "Access-Control-Allow-Headers: *\r\n"
-                 "Access-Control-Allow-Methods: GET, HEAD, OPTIONS\r\n"
+                 "Access-Control-Allow-Methods: GET, HEAD, POST, OPTIONS\r\n"
                  "Cache-Control: no-cache\r\n"
                  "Connection: close\r\n"
                  "%s"
@@ -675,13 +717,103 @@ static int send_status(HttpConn *c, int code, const char *text)
     return write_all(c, hdr, n);
 }
 
-static int send_options(HttpConn *c)
+static int query_get(const char *path, const char *key, char *out, int out_sz);
+
+static int send_json(HttpSession *c, int code, const char *json, int head_only)
+{
+    char hdr[512];
+    const char *body = json ? json : "{}";
+    int n, blen = (int)strlen(body);
+
+    n = snprintf(hdr, sizeof(hdr),
+                 "HTTP/1.1 %d %s\r\n"
+                 "Access-Control-Allow-Origin: *\r\n"
+                 "Access-Control-Allow-Headers: *\r\n"
+                 "Access-Control-Allow-Methods: GET, HEAD, POST, OPTIONS\r\n"
+                 "Cache-Control: no-cache, no-store\r\n"
+                 "Connection: close\r\n"
+                 "Content-Type: application/json; charset=utf-8\r\n"
+                 "Content-Length: %d\r\n"
+                 "\r\n",
+                 code, code == 200 ? "OK" : (code == 404 ? "Not Found" : "Error"),
+                 blen);
+    if (write_all(c, hdr, n) < 0)
+        return AVERROR(EIO);
+    if (head_only)
+        return 0;
+    return write_all(c, body, blen);
+}
+
+static int http_api_handle(HttpSession *c, const char *method, const char *path,
+                           int head_only)
+{
+    char path_noq[1024], spec[512], app[128], stream[256], allq[16];
+    char *json = NULL, *q;
+    int all = 0, ret, code = 200;
+
+    (void)method;
+
+    av_strlcpy(path_noq, path, sizeof(path_noq));
+    q = strchr(path_noq, '?');
+    if (q)
+        *q = 0;
+    if (!strcmp(path_noq, "/api/streams") || !strcmp(path_noq, "/api/stat") ||
+        !strcmp(path_noq, "/index/api/getMediaList")) {
+        ret = ffmpeg_http_live_stat_json(&json);
+        if (ret < 0 || !json)
+            return send_status(c, 500, "stat failed");
+        ret = send_json(c, 200, json, head_only);
+        av_freep(&json);
+        return ret;
+    }
+    if (!strcmp(path_noq, "/api/kick") ||
+        !strcmp(path_noq, "/index/api/close_streams")) {
+        spec[0] = 0;
+        if (query_get(path, "all", allq, sizeof(allq)))
+            all = allq[0] == '1' || !av_strcasecmp(allq, "true") ||
+                  !av_strcasecmp(allq, "yes");
+        if (query_get(path, "streams", spec, sizeof(spec)))
+            ;
+        else if (query_get(path, "spec", spec, sizeof(spec)))
+            ;
+        else if (query_get(path, "stream", stream, sizeof(stream))) {
+            if (query_get(path, "app", app, sizeof(app)) && app[0])
+                snprintf(spec, sizeof(spec), "%s/%s", app, stream);
+            else
+                av_strlcpy(spec, stream, sizeof(spec));
+        }
+        {
+            char dec[512];
+            url_decode(dec, sizeof(dec), spec);
+            av_strlcpy(spec, dec, sizeof(spec));
+        }
+        if (!all && !spec[0]) {
+            ffmpeg_http_conn_note(c, "kick-bad");
+            return send_json(c, 400,
+                             "{\"code\":-3,\"kicked\":0,\"error\":\"missing stream\"}",
+                             head_only);
+        }
+        ret = ffmpeg_http_live_kick(spec, all, &json);
+        if (ret < 0 || !json)
+            return send_status(c, 500, "kick failed");
+        if (strstr(json, "\"code\":-2"))
+            code = 404;
+        ffmpeg_http_conn_note(c, "kick");
+        http_trace(c, AV_LOG_INFO, "api kick spec=%s all=%d", spec[0] ? spec : "-", all);
+        ret = send_json(c, code, json, head_only);
+        av_freep(&json);
+        return ret;
+    }
+    return send_status(c, 404, "Not Found");
+}
+
+static int send_options(HttpSession *c)
 {
     const char *hdr =
         "HTTP/1.1 204 No Content\r\n"
         "Access-Control-Allow-Origin: *\r\n"
         "Access-Control-Allow-Headers: *\r\n"
-        "Access-Control-Allow-Methods: GET, HEAD, OPTIONS\r\n"
+        "Access-Control-Allow-Methods: GET, HEAD, POST, OPTIONS\r\n"
         "Access-Control-Max-Age: 86400\r\n"
         "Connection: close\r\n"
         "Content-Length: 0\r\n"
@@ -723,7 +855,7 @@ static int parse_range(const char *req, int64_t size, int64_t *start, int64_t *e
     return 1;
 }
 
-static int send_file(HttpConn *c, const char *path, int head_only, const char *req)
+static int send_file(HttpSession *c, const char *path, int head_only, const char *req)
 {
     FILE *fp;
     char hdr[768], buf[16 * 1024];
@@ -757,7 +889,7 @@ static int send_file(HttpConn *c, const char *path, int head_only, const char *r
                      "HTTP/1.1 206 Partial Content\r\n"
                      "Access-Control-Allow-Origin: *\r\n"
                      "Access-Control-Allow-Headers: *\r\n"
-                     "Access-Control-Allow-Methods: GET, HEAD, OPTIONS\r\n"
+                     "Access-Control-Allow-Methods: GET, HEAD, POST, OPTIONS\r\n"
                      "Accept-Ranges: bytes\r\n"
                      "Cache-Control: %s\r\n"
                      "Connection: close\r\n"
@@ -771,7 +903,7 @@ static int send_file(HttpConn *c, const char *path, int head_only, const char *r
                      "HTTP/1.1 200 OK\r\n"
                      "Access-Control-Allow-Origin: *\r\n"
                      "Access-Control-Allow-Headers: *\r\n"
-                     "Access-Control-Allow-Methods: GET, HEAD, OPTIONS\r\n"
+                     "Access-Control-Allow-Methods: GET, HEAD, POST, OPTIONS\r\n"
                      "Accept-Ranges: bytes\r\n"
                      "Cache-Control: %s\r\n"
                      "Connection: close\r\n"
@@ -791,6 +923,40 @@ static int send_file(HttpConn *c, const char *path, int head_only, const char *r
         fclose(fp);
         return AVERROR(EIO);
     }
+#if CONFIG_OPENSSL
+    if (c->ssl) {
+        while (send_len > 0) {
+            size_t chunk = FFMIN((int64_t)sizeof(buf), send_len);
+            size_t got = fread(buf, 1, chunk, fp);
+            if (!got)
+                break;
+            if (write_all(c, buf, (int)got) < 0)
+                break;
+            send_len -= (int64_t)got;
+        }
+        fclose(fp);
+        return 0;
+    }
+#endif
+#ifndef _WIN32
+    {
+        int in_fd = fileno(fp);
+        off_t off = (off_t)start;
+        while (send_len > 0 && in_fd >= 0) {
+            ssize_t got = sendfile(c->fd, in_fd, &off, (size_t)send_len);
+            if (got > 0) {
+                send_len -= got;
+                c->bytes_out += got;
+                continue;
+            }
+            if (got < 0 && http_wouldblock()) {
+                http_ev_session_wait_fd(c, HTTP_EV_OUT);
+                continue;
+            }
+            break;
+        }
+    }
+#else
     while (send_len > 0) {
         size_t chunk = FFMIN((int64_t)sizeof(buf), send_len);
         size_t got = fread(buf, 1, chunk, fp);
@@ -800,26 +966,20 @@ static int send_file(HttpConn *c, const char *path, int head_only, const char *r
             break;
         send_len -= (int64_t)got;
     }
+#endif
     fclose(fp);
     return 0;
 }
 
-static int read_request(HttpConn *c, char *req, int req_sz)
+static int read_request(HttpSession *c, char *req, int req_sz)
 {
     int n = 0, ret;
-    int64_t deadline = av_gettime_relative() + 2000000;
 
-    if (c->tcp)
-        c->tcp->flags |= AVIO_FLAG_NONBLOCK;
     while (n + 1 < req_sz) {
         int want = FFMIN(4096, req_sz - 1 - n);
         ret = http_conn_read(c, (unsigned char *)req + n, want);
-        if (ret == AVERROR(EAGAIN)) {
-            if (av_gettime_relative() > deadline)
-                break;
-            av_usleep(1000);
+        if (ret == AVERROR(EAGAIN))
             continue;
-        }
         if (ret <= 0)
             break;
         n += ret;
@@ -905,7 +1065,7 @@ static int auth_configured(void)
            (ffmpeg_http_token && ffmpeg_http_token[0]);
 }
 
-static int check_auth(HttpConn *c, const char *req, const char *path)
+static int check_auth(HttpSession *c, const char *req, const char *path)
 {
     char qtok[256], userpass[256], decoded[256];
     const char *auth;
@@ -956,7 +1116,7 @@ static int check_auth(HttpConn *c, const char *req, const char *path)
 }
 
 #if CONFIG_OPENSSL
-static int http_tls_handshake(HttpConn *c)
+static int http_tls_handshake(HttpSession *c)
 {
     int ret, err;
     int64_t deadline;
@@ -966,18 +1126,22 @@ static int http_tls_handshake(HttpConn *c)
     c->ssl = SSL_new(http_ssl_ctx);
     if (!c->ssl)
         return AVERROR(ENOMEM);
-    SSL_set_fd(c->ssl, c->fd);
-    SSL_set_accept_state(c->ssl);
+    SSL_set_fd(sess_ssl(c), c->fd);
+    SSL_set_accept_state(sess_ssl(c));
     deadline = av_gettime_relative() + 5000000;
     while (atomic_load(&http_running) && av_gettime_relative() < deadline) {
-        ret = SSL_accept(c->ssl);
+        ret = SSL_accept(sess_ssl(c));
         if (ret == 1) {
             http_trace(c, AV_LOG_INFO, "tls handshake ok");
             return 0;
         }
-        err = SSL_get_error(c->ssl, ret);
-        if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
-            av_usleep(2000);
+        err = SSL_get_error(sess_ssl(c), ret);
+        if (err == SSL_ERROR_WANT_READ) {
+            http_ev_session_wait_fd(c, HTTP_EV_IN);
+            continue;
+        }
+        if (err == SSL_ERROR_WANT_WRITE) {
+            http_ev_session_wait_fd(c, HTTP_EV_OUT);
             continue;
         }
         http_trace(c, AV_LOG_ERROR, "tls handshake failed err=%d", err);
@@ -990,7 +1154,7 @@ static int http_tls_handshake(HttpConn *c)
 
 /* Drain the client request then send a complete HTTP error. A silent TCP
  * close (no status) leaves ffplay blocked waiting for response headers. */
-static void http_reply_error(HttpConn *c, int code, const char *text)
+static void http_reply_error(HttpSession *c, int code, const char *text)
 {
     char req[8192];
 
@@ -1003,13 +1167,12 @@ static void http_reply_error(HttpConn *c, int code, const char *text)
         return;
 #endif
     }
-    http_sock_tune(c->fd, 1, c->tcp);
     read_request(c, req, sizeof(req));
     send_status(c, code, text);
     http_trace(c, AV_LOG_WARNING, "http %d %s", code, text);
 }
 
-static void http_deny_whitelist(HttpConn *c)
+static void http_deny_whitelist(HttpSession *c)
 {
     ffmpeg_http_conn_note(c, "deny-whitelist");
     http_trace(c, AV_LOG_WARNING, "deny whitelist");
@@ -1017,36 +1180,39 @@ static void http_deny_whitelist(HttpConn *c)
     send_status(c, 403, "Forbidden");
 }
 
-static void http_handle_conn(HttpConn *c)
+static void http_session_co(void *arg)
 {
+    HttpSession *c = arg;
     char req[8192], method[16], path[1024], mapped[2048];
     char host[256], ua[256], path_log[1024];
-    int n, head_only = 0;
+    int n, head_only = 0, api = 0;
     char *line, *sp1, *sp2;
+
+    if (!c)
+        return;
+    http_trace(c, AV_LOG_INFO, "connect %s", http_use_tls ? "https" : "http");
 
     if (http_use_tls) {
 #if CONFIG_OPENSSL
         if (http_tls_handshake(c) < 0) {
             ffmpeg_http_conn_note(c, "tls-fail");
-            return;
+            goto done;
         }
 #else
         ffmpeg_http_conn_note(c, "no-openssl");
         http_trace(c, AV_LOG_ERROR, "https requested but OpenSSL disabled");
-        return;
+        goto done;
 #endif
     }
-    http_sock_tune(c->fd, 1, c->tcp);
-
     n = read_request(c, req, sizeof(req));
     if (n < 0) {
         if (!allow_match(c)) {
             http_deny_whitelist(c);
-            return;
+            goto done;
         }
         ffmpeg_http_conn_note(c, "read-fail");
         http_trace(c, AV_LOG_WARNING, "read request failed: %s", av_err2str(n));
-        return;
+        goto done;
     }
 
     line = req;
@@ -1071,7 +1237,7 @@ static void http_handle_conn(HttpConn *c)
 
     if (!allow_match(c)) {
         http_deny_whitelist(c);
-        return;
+        goto done;
     }
     if (http_nb_nets > 0)
         http_trace(c, AV_LOG_INFO, "allow whitelist");
@@ -1080,22 +1246,38 @@ static void http_handle_conn(HttpConn *c)
         send_options(c);
         ffmpeg_http_conn_note(c, "options");
         http_trace(c, AV_LOG_INFO, "reply 204 OPTIONS");
-        return;
+        goto done;
+    }
+    {
+        char pchk[1024], *qq;
+        av_strlcpy(pchk, path, sizeof(pchk));
+        qq = strchr(pchk, '?');
+        if (qq)
+            *qq = 0;
+        if (!strncmp(pchk, "/api/", 5) || !strncmp(pchk, "/index/api/", 11))
+            api = 1;
     }
     if (!av_strcasecmp(method, "HEAD"))
         head_only = 1;
-    else if (av_strcasecmp(method, "GET")) {
+    if (av_strcasecmp(method, "GET") && av_strcasecmp(method, "HEAD") &&
+        !(api && !av_strcasecmp(method, "POST"))) {
         ffmpeg_http_conn_note(c, "method");
         http_trace(c, AV_LOG_WARNING, "method not allowed");
         send_status(c, 405, "Method Not Allowed");
-        return;
+        goto done;
     }
 
     if (!check_auth(c, req, path)) {
         ffmpeg_http_conn_note(c, "auth-fail");
         http_trace(c, AV_LOG_WARNING, "http 401 Unauthorized");
         send_status(c, 401, "Unauthorized");
-        return;
+        goto done;
+    }
+
+    if (api) {
+        http_trace(c, AV_LOG_INFO, "route api %s", path_log);
+        http_api_handle(c, method, path, head_only);
+        goto done;
     }
 
     {
@@ -1117,7 +1299,7 @@ static void http_handle_conn(HttpConn *c)
                        path_log, lowdelay ? " lowdelay" : "");
             ffmpeg_http_live_serve(c, lfmt, lmime, head_only, pub_idx,
                                    lowdelay, c->t0);
-            return;
+            goto done;
         }
     }
 file_only:
@@ -1125,13 +1307,13 @@ file_only:
         ffmpeg_http_conn_note(c, "not-found");
         http_trace(c, AV_LOG_WARNING, "404 no http_root");
         send_status(c, 404, "Not Found");
-        return;
+        goto done;
     }
     if (map_url_path(path, mapped, sizeof(mapped)) < 0) {
         ffmpeg_http_conn_note(c, "forbidden");
         http_trace(c, AV_LOG_WARNING, "403 path");
         send_status(c, 403, "Forbidden");
-        return;
+        goto done;
     }
     if (!strcmp(path, "/") || !path[0]) {
         FILE *fp = fopen(mapped, "rb");
@@ -1144,108 +1326,17 @@ file_only:
     send_file(c, mapped, head_only, req);
     ffmpeg_http_conn_note(c, "file-done");
     http_trace(c, AV_LOG_INFO, "file done");
-    return;
+    goto done;
 bad:
     if (!allow_match(c)) {
         http_deny_whitelist(c);
-        return;
+        goto done;
     }
     ffmpeg_http_conn_note(c, "bad-request");
     http_trace(c, AV_LOG_WARNING, "400 bad request");
     send_status(c, 400, "Bad Request");
-}
-
-static int http_job_push(HttpConn *c)
-{
-    pthread_mutex_lock(&http_q_mu);
-    if (http_q_count >= HTTP_JOB_HWM) {
-        pthread_mutex_unlock(&http_q_mu);
-        return AVERROR(EAGAIN);
-    }
-    http_jobq[http_q_tail] = c;
-    http_q_tail = (http_q_tail + 1) % HTTP_JOB_HWM;
-    http_q_count++;
-    pthread_cond_signal(&http_q_cv);
-    pthread_mutex_unlock(&http_q_mu);
-    return 0;
-}
-
-static HttpConn *http_job_pop(void)
-{
-    HttpConn *c = NULL;
-
-    pthread_mutex_lock(&http_q_mu);
-    while (atomic_load(&http_running) && http_q_count == 0)
-        pthread_cond_wait(&http_q_cv, &http_q_mu);
-    if (http_q_count > 0) {
-        c = http_jobq[http_q_head];
-        http_jobq[http_q_head] = NULL;
-        http_q_head = (http_q_head + 1) % HTTP_JOB_HWM;
-        http_q_count--;
-    }
-    pthread_mutex_unlock(&http_q_mu);
-    return c;
-}
-
-static void *http_client_worker_fn(void *arg)
-{
-    (void)arg;
-    while (atomic_load(&http_running)) {
-        HttpConn *c = http_job_pop();
-        if (!c)
-            break;
-        http_handle_conn(c);
-        http_conn_free(&c);
-        atomic_fetch_sub(&http_clients, 1);
-    }
-    return NULL;
-}
-
-static void *http_accept_worker(void *arg)
-{
-    (void)arg;
-    while (atomic_load(&http_running)) {
-        URLContext *client = NULL;
-        HttpConn *conn;
-        int ret;
-
-        ret = ffurl_accept(http_listen, &client);
-        if (ret < 0) {
-            if (!atomic_load(&http_running))
-                break;
-            if (ret == AVERROR(EAGAIN) || ret == AVERROR(ETIMEDOUT))
-                continue;
-            av_usleep(20 * 1000);
-            continue;
-        }
-        if (!atomic_load(&http_running)) {
-            ffurl_closep(&client);
-            break;
-        }
-        conn = av_mallocz(sizeof(*conn));
-        if (!conn) {
-            ffurl_closep(&client);
-            continue;
-        }
-        conn->tcp = client;
-        conn->t0 = av_gettime_relative();
-        conn->fd = ffurl_get_file_handle(client);
-        http_fill_peer(conn);
-        http_sock_tune(conn->fd, 0, client);
-        http_trace(conn, AV_LOG_INFO, "connect %s",
-                   http_use_tls ? "https" : "http");
-
-        atomic_fetch_add(&http_clients, 1);
-        if (http_job_push(conn) < 0) {
-            atomic_fetch_sub(&http_clients, 1);
-            ffmpeg_http_conn_note(conn, "overload");
-            http_trace(conn, AV_LOG_WARNING,
-                       "overload (queue=%d), 503", HTTP_JOB_HWM);
-            http_reply_error(conn, 503, "Service Unavailable");
-            http_conn_free(&conn);
-        }
-    }
-    return NULL;
+done:
+    http_session_cleanup(c);
 }
 
 static int http_tls_ctx_init(void)
@@ -1259,11 +1350,25 @@ static int http_tls_ctx_init(void)
                "http-server: https needs -http_cert and -http_key\n");
         return AVERROR(EINVAL);
     }
+    /* This tree links OpenSSL 1.0.2 (SSL_library_init). 1.1-only APIs
+     * such as OPENSSL_init_ssl / TLS_server_method would be implicit
+     * declarations under -Werror=implicit-function-declaration. */
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
+    SSL_library_init();
+    SSL_load_error_strings();
+    http_ssl_ctx = SSL_CTX_new(SSLv23_server_method());
+#else
     OPENSSL_init_ssl(0, NULL);
     http_ssl_ctx = SSL_CTX_new(TLS_server_method());
+#endif
     if (!http_ssl_ctx)
         return AVERROR(ENOMEM);
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
+    SSL_CTX_set_options(http_ssl_ctx, SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3 |
+                        SSL_OP_NO_TLSv1 | SSL_OP_NO_TLSv1_1);
+#else
     SSL_CTX_set_min_proto_version(http_ssl_ctx, TLS1_2_VERSION);
+#endif
     if (SSL_CTX_use_certificate_chain_file(http_ssl_ctx, ffmpeg_http_cert) != 1) {
         ffmpeg_http_log( AV_LOG_ERROR, "http-server: load cert %s failed\n",
                ffmpeg_http_cert);
@@ -1297,9 +1402,8 @@ static int http_tls_ctx_init(void)
 
 int ffmpeg_http_server_init(const char *url, const char *root)
 {
-    char host[256], tcp_url[512];
-    int port = 8080, ret, i, nworkers;
-    AVDictionary *opts = NULL;
+    char host[256];
+    int port = 8080, ret, nworkers;
     const char *use_root = root;
 
     if (!url || !url[0])
@@ -1338,80 +1442,23 @@ int ffmpeg_http_server_init(const char *url, const char *root)
     if (ret < 0)
         return ret;
 
-    snprintf(tcp_url, sizeof(tcp_url), "tcp://%s:%d", host, port);
-    av_dict_set(&opts, "listen", "2", 0);
-    av_dict_set(&opts, "listen_timeout", "-1", 0);
-    av_dict_set(&opts, "timeout", "2000000", 0);
-    av_dict_set(&opts, "tcp_nodelay", "1", 0);
-    av_dict_set(&opts, "tcp_keepalive", "1", 0);
-    av_dict_set(&opts, "send_buffer_size", "262144", 0);
-    ret = ffurl_open_whitelist(&http_listen, tcp_url, AVIO_FLAG_READ_WRITE,
-                               &int_cb, &opts, "tcp", NULL, NULL);
-    av_dict_free(&opts);
-    if (ret < 0) {
-        ffmpeg_http_log( AV_LOG_ERROR, "http-server: bind %s failed: %s\n",
-               tcp_url, av_err2str(ret));
-        return ret;
-    }
-    {
-        int fd = ffurl_get_file_handle(http_listen);
-        if (fd >= 0) {
-            if (listen(fd, HTTP_LISTEN_BACKLOG) < 0)
-                ffmpeg_http_log( AV_LOG_WARNING,
-                       "http-server: listen backlog %d failed: %s\n",
-                       HTTP_LISTEN_BACKLOG, strerror(errno));
-#ifndef _WIN32
-#ifdef TCP_DEFER_ACCEPT
-            {
-                int da = 3;
-                setsockopt(fd, IPPROTO_TCP, TCP_DEFER_ACCEPT, &da, sizeof(da));
-            }
-#endif
-#ifdef TCP_FASTOPEN
-            {
-                int qlen = 16;
-                setsockopt(fd, IPPROTO_TCP, TCP_FASTOPEN, &qlen, sizeof(qlen));
-            }
-#endif
-#endif
-        }
-    }
-
     nworkers = ffmpeg_http_workers;
     if (nworkers <= 0)
-        nworkers = 32;
-    if (nworkers > 256)
-        nworkers = 256;
-    http_workers = av_calloc(nworkers, sizeof(*http_workers));
-    if (!http_workers)
-        return AVERROR(ENOMEM);
+        nworkers = http_ev_cpu_count();
+    if (nworkers > HTTP_EV_MAX)
+        nworkers = HTTP_EV_MAX;
 
     atomic_store(&http_running, 1);
-    atomic_store(&http_clients, 0);
-    http_q_head = http_q_tail = http_q_count = 0;
-    for (i = 0; i < nworkers; i++) {
-        ret = pthread_create(&http_workers[i], NULL, http_client_worker_fn, NULL);
-        if (ret) {
-            atomic_store(&http_running, 0);
-            pthread_cond_broadcast(&http_q_cv);
-            ffmpeg_http_log( AV_LOG_ERROR, "http-server: worker %d failed: %s\n",
-                   i, strerror(ret));
-            return AVERROR(ret);
-        }
-        http_nb_workers++;
-    }
-    ret = pthread_create(&http_accept_th, NULL, http_accept_worker, NULL);
-    if (ret) {
+    ret = http_ev_start(host, port, nworkers, http_session_co);
+    if (ret < 0) {
         atomic_store(&http_running, 0);
-        pthread_cond_broadcast(&http_q_cv);
-        ffmpeg_http_log( AV_LOG_ERROR, "http-server: accept thread failed: %s\n",
-               strerror(ret));
-        return AVERROR(ret);
+        return ret;
     }
     http_thread_started = 1;
+    nworkers = http_ev_nb_workers();
     ffmpeg_http_log( AV_LOG_INFO,
-           "http-server: %s %s workers=%d hwm=%d auth=%s allow=%s files=%s live=%s\n",
-           http_use_tls ? "https" : "http", url, nworkers, HTTP_JOB_HWM,
+           "http-server: %s %s workers=%d reuseport=1 stack=64k auth=%s allow=%s files=%s live=%s\n",
+           http_use_tls ? "https" : "http", url, nworkers,
            auth_configured() ? "on" : "off",
            http_nb_nets > 0 ? ffmpeg_http_allow : "any",
            http_root_abs ? http_root_abs : "(off)",
@@ -1421,35 +1468,12 @@ int ffmpeg_http_server_init(const char *url, const char *root)
 
 void ffmpeg_http_server_uninit(void)
 {
-    int64_t wait_us = 0;
-    int i;
-
     if (!http_thread_started)
         return;
     atomic_store(&http_running, 0);
     ffmpeg_http_live_shutdown();
-    ffurl_closep(&http_listen);
-    pthread_join(http_accept_th, NULL);
-    pthread_mutex_lock(&http_q_mu);
-    pthread_cond_broadcast(&http_q_cv);
-    pthread_mutex_unlock(&http_q_mu);
-    for (i = 0; i < http_nb_workers; i++)
-        pthread_join(http_workers[i], NULL);
-    http_nb_workers = 0;
-    av_freep(&http_workers);
-    while (http_q_count > 0) {
-        HttpConn *c = http_jobq[http_q_head];
-        http_jobq[http_q_head] = NULL;
-        http_q_head = (http_q_head + 1) % HTTP_JOB_HWM;
-        http_q_count--;
-        http_conn_free(&c);
-        atomic_fetch_sub(&http_clients, 1);
-    }
+    http_ev_stop();
     http_thread_started = 0;
-    while (atomic_load(&http_clients) > 0 && wait_us < 2000000) {
-        av_usleep(20 * 1000);
-        wait_us += 20 * 1000;
-    }
 #if CONFIG_OPENSSL
     if (http_ssl_ctx) {
         SSL_CTX_free(http_ssl_ctx);

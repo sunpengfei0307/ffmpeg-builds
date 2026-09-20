@@ -2382,7 +2382,7 @@ const OptionDef options[] = {
         "app/stream[:index]" },
     { "http_workers",           OPT_TYPE_INT, OPT_EXPERT,
         { &ffmpeg_http_workers },
-        "HTTP worker threads (default 32, like a small nginx worker pool)", "n" },
+        "HTTP EventWorkers (0=CPU count, default 0; SO_REUSEPORT per core)", "n" },
     { "task_id",                OPT_TYPE_FUNC, OPT_FUNC_ARG | OPT_EXPERT,
         { .func_arg = opt_task_id },
         "ppc/pgc task id; enables status poster "

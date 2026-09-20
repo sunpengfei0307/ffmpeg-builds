@@ -98,12 +98,6 @@ typedef struct DemuxStream {
     uint64_t                 nb_packets;
     // combined size of all the packets read
     uint64_t                 data_size;
-    // latest wallclock time at which packet reading resumed after a stall - used for readrate
-    int64_t                  resume_wc;
-    // timestamp of first packet sent after the latest stall - used for readrate
-    int64_t                  resume_pts;
-    // measure of how far behind packet reading is against spceified readrate
-    int64_t                  lag;
 } DemuxStream;
 
 typedef struct DemuxStreamGroup {
@@ -138,6 +132,13 @@ typedef struct Demuxer {
     /* pts with the smallest/largest values ever seen */
     Timestamp             min_pts;
     Timestamp             max_pts;
+    /* -stream_loop: common A/V end on the file timeline (AV_TIME_BASE).
+     * Longer track's tail is dropped before send. */
+    int64_t               loop_trim_us;
+    int64_t               loop_seg_us;
+    int64_t               loop_end_v_us;
+    int64_t               loop_end_a_us;
+    int64_t               loop_min_us;
 
     /* number of streams that the user was warned of */
     int                   nb_streams_warn;
@@ -145,6 +146,12 @@ typedef struct Demuxer {
     float                 readrate;
     double                readrate_initial_burst;
     float                 readrate_catchup;
+    // latest wallclock time at which packet reading resumed after a stall - used for readrate
+    int64_t               resume_wc;
+    // relative timestamp of first packet sent after the latest stall - used for readrate
+    int64_t               resume_progress;
+    // measure of how far behind packet reading is against specified readrate
+    int64_t               lag;
 
     Scheduler            *sch;
 
@@ -196,26 +203,98 @@ static void report_new_stream(Demuxer *d, const AVPacket *pkt)
     d->nb_streams_warn = pkt->stream_index + 1;
 }
 
+static int64_t loop_pkt_end_us(const AVPacket *pkt, AVRational tb)
+{
+    int64_t ts, dur;
+
+    ts = pkt->pts != AV_NOPTS_VALUE ? pkt->pts : pkt->dts;
+    if (ts == AV_NOPTS_VALUE)
+        return AV_NOPTS_VALUE;
+    dur = pkt->duration > 0 ? pkt->duration : 0;
+    return av_rescale_q(ts + dur, tb, AV_TIME_BASE_Q);
+}
+
+static int64_t loop_stream_end_us(const AVStream *st)
+{
+    int64_t start = 0;
+
+    if (!st || !st->codecpar)
+        return AV_NOPTS_VALUE;
+    if (st->codecpar->codec_type != AVMEDIA_TYPE_VIDEO &&
+        st->codecpar->codec_type != AVMEDIA_TYPE_AUDIO)
+        return AV_NOPTS_VALUE;
+    if (st->start_time != AV_NOPTS_VALUE)
+        start = av_rescale_q(st->start_time, st->time_base, AV_TIME_BASE_Q);
+    if (st->duration != AV_NOPTS_VALUE && st->duration > 0)
+        return start + av_rescale_q(st->duration, st->time_base, AV_TIME_BASE_Q);
+    return AV_NOPTS_VALUE;
+}
+
+static int64_t loop_trim_from_container(Demuxer *d)
+{
+    InputFile *f = &d->f;
+    int64_t t = AV_NOPTS_VALUE;
+
+    for (int i = 0; i < f->nb_streams; i++) {
+        DemuxStream *ds = ds_from_ist(f->streams[i]);
+        int64_t end;
+
+        if (ds->discard)
+            continue;
+        end = loop_stream_end_us(f->streams[i]->st);
+        if (end == AV_NOPTS_VALUE)
+            continue;
+        t = (t == AV_NOPTS_VALUE) ? end : FFMIN(t, end);
+    }
+    return t;
+}
+
+static void loop_commit_trim(Demuxer *d)
+{
+    int64_t t = AV_NOPTS_VALUE;
+
+    if (d->loop_trim_us == AV_NOPTS_VALUE) {
+        if (d->loop_end_v_us != AV_NOPTS_VALUE &&
+            d->loop_end_a_us != AV_NOPTS_VALUE)
+            t = FFMIN(d->loop_end_v_us, d->loop_end_a_us);
+        else if (d->loop_end_v_us != AV_NOPTS_VALUE)
+            t = d->loop_end_v_us;
+        else
+            t = d->loop_end_a_us;
+        d->loop_trim_us = t;
+        if (t != AV_NOPTS_VALUE)
+            av_log(d, AV_LOG_INFO, "stream_loop trim to %s (min A/V end)\n",
+                   av_ts2timestr(t, &AV_TIME_BASE_Q));
+    }
+    if (d->loop_seg_us == AV_NOPTS_VALUE && d->loop_trim_us != AV_NOPTS_VALUE) {
+        int64_t min_us = d->loop_min_us != AV_NOPTS_VALUE ? d->loop_min_us : 0;
+        d->loop_seg_us = d->loop_trim_us - min_us;
+        if (d->loop_seg_us < 0)
+            d->loop_seg_us = 0;
+    }
+}
+
 static int seek_to_start(Demuxer *d, Timestamp end_pts)
 {
     InputFile    *ifile = &d->f;
     AVFormatContext *is = ifile->ctx;
     int ret;
 
+    (void)end_pts;
+
     ret = avformat_seek_file(is, -1, INT64_MIN, is->start_time, is->start_time, 0);
     if (ret < 0)
         return ret;
 
-    if (end_pts.ts != AV_NOPTS_VALUE &&
-        (d->max_pts.ts == AV_NOPTS_VALUE ||
-         av_compare_ts(d->max_pts.ts, d->max_pts.tb, end_pts.ts, end_pts.tb) < 0))
-        d->max_pts = end_pts;
+    loop_commit_trim(d);
 
-    if (d->max_pts.ts != AV_NOPTS_VALUE) {
-        int64_t min_pts = d->min_pts.ts == AV_NOPTS_VALUE ? 0 : d->min_pts.ts;
-        d->duration.ts = d->max_pts.ts - av_rescale_q(min_pts, d->min_pts.tb, d->max_pts.tb);
-    }
-    d->duration.tb = d->max_pts.tb;
+    d->duration.tb = AV_TIME_BASE_Q;
+    if (d->loop_seg_us != AV_NOPTS_VALUE && d->loop_seg_us > 0)
+        d->duration.ts += d->loop_seg_us;
+
+    d->loop_end_v_us = AV_NOPTS_VALUE;
+    d->loop_end_a_us = AV_NOPTS_VALUE;
+    d->loop_min_us   = AV_NOPTS_VALUE;
 
     if (d->loop > 0)
         d->loop--;
@@ -413,6 +492,29 @@ static int ts_fixup(Demuxer *d, AVPacket *pkt, FrameData *fd)
         }
     }
 
+    /* Measure on the file timeline (before ts_offset) so it matches
+     * container duration used for loop_trim_us. */
+    if (d->loop) {
+        int64_t ts = pkt->pts != AV_NOPTS_VALUE ? pkt->pts : pkt->dts;
+        if (ts != AV_NOPTS_VALUE) {
+            int64_t start_us = av_rescale_q(ts, pkt->time_base, AV_TIME_BASE_Q);
+            int64_t end_us = loop_pkt_end_us(pkt, pkt->time_base);
+            enum AVMediaType type = ist->st->codecpar->codec_type;
+
+            if (d->loop_min_us == AV_NOPTS_VALUE || start_us < d->loop_min_us)
+                d->loop_min_us = start_us;
+            if (end_us != AV_NOPTS_VALUE) {
+                if (type == AVMEDIA_TYPE_VIDEO) {
+                    if (d->loop_end_v_us == AV_NOPTS_VALUE || end_us > d->loop_end_v_us)
+                        d->loop_end_v_us = end_us;
+                } else if (type == AVMEDIA_TYPE_AUDIO) {
+                    if (d->loop_end_a_us == AV_NOPTS_VALUE || end_us > d->loop_end_a_us)
+                        d->loop_end_a_us = end_us;
+                }
+            }
+        }
+    }
+
     if (pkt->dts != AV_NOPTS_VALUE)
         pkt->dts += av_rescale_q(ifile->ts_offset, AV_TIME_BASE_Q, pkt->time_base);
     if (pkt->pts != AV_NOPTS_VALUE)
@@ -529,44 +631,59 @@ static void readrate_sleep(Demuxer *d)
                          );
     int64_t initial_burst = AV_TIME_BASE * d->readrate_initial_burst;
     int resume_warn = 0;
+    DemuxStream *slowest = NULL;
+    int64_t progress = INT64_MAX;
+    int64_t now, wc_elapsed, max_prog, lag, limit;
 
+    /* Pace the file by the furthest-behind stream. Sleeping per-stream
+     * (FFmpeg 8.1) lets a well-ahead audio cluster stall demux while video
+     * lag grows without bound — typical of ZLM/mp4 recordings. */
     for (int i = 0; i < f->nb_streams; i++) {
         InputStream *ist = f->streams[i];
         DemuxStream  *ds = ds_from_ist(ist);
-        int64_t stream_ts_offset, pts, now, wc_elapsed, elapsed, lag, max_pts, limit_pts;
+        int64_t stream_ts_offset, pts, pts_diff;
 
-        if (ds->discard) continue;
+        if (ds->discard || ds->finished || ds->first_dts == AV_NOPTS_VALUE)
+            continue;
 
-        stream_ts_offset = FFMAX(ds->first_dts != AV_NOPTS_VALUE ? ds->first_dts : 0, file_start);
+        stream_ts_offset = FFMAX(ds->first_dts, file_start);
         pts = av_rescale(ds->dts, 1000000, AV_TIME_BASE);
-        now = av_gettime_relative();
-        wc_elapsed = now - d->wallclock_start;
-
-        if (pts <= stream_ts_offset + initial_burst) continue;
-
-        max_pts = stream_ts_offset + initial_burst + (int64_t)(wc_elapsed * d->readrate);
-        lag = FFMAX(max_pts - pts, 0);
-        if ( (!ds->lag && lag > 0.3 * AV_TIME_BASE) || ( lag > ds->lag + 0.3 * AV_TIME_BASE) ) {
-            ds->lag = lag;
-            ds->resume_wc = now;
-            ds->resume_pts = pts;
-            av_log_once(ds, AV_LOG_WARNING, AV_LOG_DEBUG, &resume_warn,
-                        "Resumed reading at pts %0.3f with rate %0.3f after a lag of %0.3fs\n",
-                        (float)pts/AV_TIME_BASE, d->readrate_catchup, (float)lag/AV_TIME_BASE);
+        pts_diff = pts - stream_ts_offset;
+        if (pts_diff < progress) {
+            progress = pts_diff;
+            slowest = ds;
         }
-        if (ds->lag && !lag)
-            ds->lag = ds->resume_wc = ds->resume_pts = 0;
-        if (ds->resume_wc) {
-            elapsed = now - ds->resume_wc;
-            limit_pts = ds->resume_pts + (int64_t)(elapsed * d->readrate_catchup);
-        } else {
-            elapsed = wc_elapsed;
-            limit_pts = max_pts;
-        }
-
-        if (pts > limit_pts)
-            av_usleep(pts - limit_pts);
     }
+
+    if (!slowest || progress <= initial_burst)
+        return;
+
+    now = av_gettime_relative();
+    wc_elapsed = now - d->wallclock_start;
+    max_prog = initial_burst + (int64_t)(wc_elapsed * d->readrate);
+    lag = FFMAX(max_prog - progress, 0);
+
+    if ((!d->lag && lag > 0.3 * AV_TIME_BASE) || (lag > d->lag + 0.3 * AV_TIME_BASE)) {
+        d->lag = lag;
+        d->resume_wc = now;
+        d->resume_progress = progress;
+
+        av_log_once(slowest, AV_LOG_WARNING, AV_LOG_DEBUG, &resume_warn,
+                    "Resumed reading at pts %0.3f with rate %0.3f after a lag of %0.3fs\n",
+                    (float)(FFMAX(slowest->first_dts, file_start) + progress) / AV_TIME_BASE,
+                    d->readrate_catchup, (float)lag / AV_TIME_BASE);
+    }
+    if (d->lag && !lag)
+        d->lag = d->resume_wc = d->resume_progress = 0;
+    if (d->resume_wc) {
+        int64_t elapsed = now - d->resume_wc;
+        limit = d->resume_progress + (int64_t)(elapsed * d->readrate_catchup);
+    } else {
+        limit = max_prog;
+    }
+
+    if (progress > limit)
+        av_usleep(progress - limit);
 }
 
 static int do_send(Demuxer *d, DemuxStream *ds, AVPacket *pkt, unsigned flags,
@@ -813,6 +930,14 @@ static int input_thread(void *arg)
             report_new_stream(d, dt.pkt_demux);
             av_packet_unref(dt.pkt_demux);
             continue;
+        }
+
+        if (d->loop && d->loop_trim_us != AV_NOPTS_VALUE) {
+            int64_t end_us = loop_pkt_end_us(dt.pkt_demux, ds->ist.st->time_base);
+            if (end_us != AV_NOPTS_VALUE && end_us > d->loop_trim_us) {
+                av_packet_unref(dt.pkt_demux);
+                continue;
+            }
         }
 
         if (dt.pkt_demux->flags & AV_PKT_FLAG_CORRUPT) {
@@ -2148,9 +2273,14 @@ int ifile_open(const OptionsContext *o, const char *filename, Scheduler *sch)
     d->loop = o->loop;
     d->nb_streams_warn = ic->nb_streams;
 
-    d->duration        = (Timestamp){ .ts = 0,              .tb = (AVRational){ 1, 1 } };
+    d->duration        = (Timestamp){ .ts = 0,              .tb = AV_TIME_BASE_Q };
     d->min_pts         = (Timestamp){ .ts = AV_NOPTS_VALUE, .tb = (AVRational){ 1, 1 } };
     d->max_pts         = (Timestamp){ .ts = AV_NOPTS_VALUE, .tb = (AVRational){ 1, 1 } };
+    d->loop_trim_us    = AV_NOPTS_VALUE;
+    d->loop_seg_us     = AV_NOPTS_VALUE;
+    d->loop_end_v_us   = AV_NOPTS_VALUE;
+    d->loop_end_a_us   = AV_NOPTS_VALUE;
+    d->loop_min_us     = AV_NOPTS_VALUE;
 
     d->readrate = o->readrate ? o->readrate : 0.0;
     if (d->readrate < 0.0f) {
@@ -2197,6 +2327,13 @@ int ifile_open(const OptionsContext *o, const char *filename, Scheduler *sch)
             av_dict_free(&opts_used);
             return ret;
         }
+    }
+
+    if (d->loop) {
+        d->loop_trim_us = loop_trim_from_container(d);
+        if (d->loop_trim_us != AV_NOPTS_VALUE)
+            av_log(d, AV_LOG_INFO, "stream_loop trim to %s (from container)\n",
+                   av_ts2timestr(d->loop_trim_us, &AV_TIME_BASE_Q));
     }
 
     /* Add all the stream groups from the given input file to the demuxer */

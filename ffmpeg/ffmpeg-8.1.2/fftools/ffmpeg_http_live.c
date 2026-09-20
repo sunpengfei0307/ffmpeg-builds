@@ -6,15 +6,19 @@
 #include "config.h"
 
 #include "ffmpeg.h"
+#include "ffmpeg_http_ev.h"
+#include "ffmpeg_http_ring.h"
 
 #include <errno.h>
 #include <inttypes.h>
+#include <stdint.h>
 #include <stdatomic.h>
 #include <stddef.h>
 #include <string.h>
 #include <time.h>
 
 #include "libavutil/avstring.h"
+#include "libavutil/bprint.h"
 #include "libavutil/error.h"
 #include "libavutil/log.h"
 #include "libavutil/mem.h"
@@ -24,6 +28,7 @@
 #include "libavutil/intreadwrite.h"
 
 #include "libavcodec/avcodec.h"
+#include "libavcodec/bsf.h"
 #include "libavcodec/packet.h"
 #include "libavformat/avformat.h"
 #include "libavformat/avio.h"
@@ -37,7 +42,11 @@ int ffmpeg_http_live = 1;
 #define LIVE_SUB_MAX_PKTS   256
 #define LIVE_GOP_MAX_PKTS   512
 #define LIVE_WAIT_PAR_US    (10 * 1000000LL)
-#define LIVE_AVIO_BUF       65536
+#define LIVE_AVIO_BUF       (256 * 1024)
+#define LIVE_FMT_FLV        0
+#define LIVE_FMT_TS         1
+#define LIVE_FMT_MP4        2
+#define LIVE_FMT_NB         3
 
 typedef struct LiveNode {
     AVPacket *pkt;
@@ -72,9 +81,48 @@ struct HttpLivePub {
     AVCodecParameters *apar;
     AVRational vtb;
     AVRational atb;
+    AVRational vfr;
+    int a_pad;
+    int a_rate;
     LiveList ready;
     LiveList building;
     LiveSub *subs;
+    atomic_int gop_ready;
+    atomic_int viewers[HTTP_EV_MAX][LIVE_FMT_NB];
+    atomic_int fmt_want[LIVE_FMT_NB];
+    atomic_int mux_on[LIVE_FMT_NB];
+    struct LiveFmtMux {
+        AVFormatContext *oc;
+        AVIOContext *pb;
+        unsigned char *iobuf;
+        uint8_t *acc;
+        int acc_len, acc_sz, acc_pos;
+        int64_t file_pos;
+        HttpLiveBuf *header;
+        HttpPtrRing ring;
+        int v_out, a_out;
+        int to_avcc, to_asc;
+        int frag_key;
+        int64_t ts_off;
+        int have_off;
+        int64_t last_dts[2];
+        int64_t last_dur[2];
+        int64_t v_priming;
+        int64_t a_priming;
+        AVBSFContext *vbsf;
+        const char *name;
+    } fmux[LIVE_FMT_NB];
+    int64_t t_start;
+    int64_t last_key_pts;
+    int64_t gop_us;
+    atomic_uint_fast64_t bytes_v;
+    atomic_uint_fast64_t bytes_a;
+    atomic_uint_fast64_t bytes_out;
+    atomic_uint_fast64_t frames_v;
+    int64_t rate_t;
+    uint64_t prev_bytes_v, prev_bytes_a, prev_bytes_out, prev_frames_v;
+    int64_t v_bps, a_bps, out_bps;
+    double fps;
 };
 
 typedef struct LiveBindSpec {
@@ -92,6 +140,9 @@ static pthread_mutex_t live_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  live_cond  = PTHREAD_COND_INITIALIZER;
 static atomic_int live_inited;
 static atomic_int live_running;
+static pthread_t live_stat_th;
+static atomic_int live_stat_on;
+static int live_stat_started;
 
 static LiveBindSpec *bind_specs;
 static int nb_bind_specs;
@@ -208,6 +259,25 @@ static int live_ensure_par(HttpLivePub *pub, const OutputStream *ost,
         *tb = ost->st->time_base;
     else
         *tb = is_video ? (AVRational){ 1, 90000 } : (AVRational){ 1, 48000 };
+    if (is_video) {
+        if (ost->st && ost->st->avg_frame_rate.num)
+            pub->vfr = ost->st->avg_frame_rate;
+        else if (ost->enc && ost->enc->enc_ctx && ost->enc->enc_ctx->framerate.num)
+            pub->vfr = ost->enc->enc_ctx->framerate;
+        else
+            pub->vfr = (AVRational){ 25, 1 };
+    } else {
+        if (ost->enc && ost->enc->enc_ctx) {
+            if (ost->enc->enc_ctx->initial_padding > 0)
+                pub->a_pad = ost->enc->enc_ctx->initial_padding;
+            if (ost->enc->enc_ctx->sample_rate > 0)
+                pub->a_rate = ost->enc->enc_ctx->sample_rate;
+        }
+        if (!pub->a_rate && ost->st && ost->st->codecpar)
+            pub->a_rate = ost->st->codecpar->sample_rate;
+        if (!pub->a_pad && ost->st && ost->st->codecpar)
+            pub->a_pad = ost->st->codecpar->initial_padding;
+    }
     if (!is_video && ost->st && ost->st->codecpar &&
         !(*dst)->extradata_size && ost->st->codecpar->extradata_size > 0) {
         uint8_t *e = av_mallocz(ost->st->codecpar->extradata_size +
@@ -225,8 +295,34 @@ static int live_ensure_par(HttpLivePub *pub, const OutputStream *ost,
 
 static int live_is_annexb(const uint8_t *p, int n)
 {
-    return p && n >= 4 &&
-           (AV_RB32(p) == 0x00000001 || AV_RB24(p) == 0x000001);
+    int nal;
+
+    if (!p || n < 4)
+        return 0;
+    if (AV_RB32(p) == 0x00000001)
+        return 1;
+    /* 3-byte start code. Do not treat AVCC length 0x000001xx (256–511)
+     * as Annex B: that false positive re-parses length-prefixed NALs
+     * and yields Invalid NAL 0 / log2_max_frame_num=31. */
+    if (AV_RB24(p) != 0x000001)
+        return 0;
+    nal = p[3] & 0x1f;
+    if (nal >= 1 && nal <= 23)
+        return 1;
+    /* HEVC: nal_unit_type in bits 1–6 (VPS=32 … SEI=39/40). */
+    nal = (p[3] >> 1) & 0x3f;
+    return nal >= 1 && nal <= 40;
+}
+
+/* AVCC: 4-byte NAL length, not a start code. copy 出来的包通常是这种。 */
+static int live_is_avcc_nal(const uint8_t *p, int n)
+{
+    uint32_t sz;
+
+    if (!p || n < 5 || live_is_annexb(p, n))
+        return 0;
+    sz = AV_RB32(p);
+    return sz > 0 && sz <= (uint32_t)(n - 4);
 }
 
 static int live_mux_avcc(const char *fmt)
@@ -259,28 +355,14 @@ static int live_apply_extradata(AVCodecParameters *par, const uint8_t *data, int
 /* GOP packets stay encoder-native (NVENC Annex B). FLV/MP4 need AVCC extra
  * and length-prefixed NALs; a homemade AVCC extra with extra[0]==1 makes the
  * muxer skip conversion and write start codes as NAL sizes (0x0104xxxx). */
-static int live_par_to_avcc(AVCodecParameters *par, const AVPacket *key)
+static int live_avcc_from_annexb(AVCodecParameters *par, const uint8_t *src, int len)
 {
     AVIOContext *pb = NULL;
-    const uint8_t *src;
     uint8_t *buf = NULL;
-    int len, size, ret;
+    int size, ret;
 
-    if (!par)
+    if (!par || !src || len <= 0)
         return 0;
-    if (par->codec_id != AV_CODEC_ID_H264 && par->codec_id != AV_CODEC_ID_HEVC)
-        return 0;
-    if (live_extra_is_avcc(par))
-        return 0;
-    if (live_is_annexb(par->extradata, par->extradata_size)) {
-        src = par->extradata;
-        len = par->extradata_size;
-    } else if (key && live_is_annexb(key->data, key->size)) {
-        src = key->data;
-        len = key->size;
-    } else {
-        return 0;
-    }
     ret = avio_open_dyn_buf(&pb);
     if (ret < 0)
         return ret;
@@ -291,7 +373,7 @@ static int live_par_to_avcc(AVCodecParameters *par, const AVPacket *key)
     size = avio_close_dyn_buf(pb, &buf);
     if (ret < 0) {
         av_free(buf);
-        return ret;
+        return 0;
     }
     if (size <= 0 || !buf) {
         av_free(buf);
@@ -303,12 +385,84 @@ static int live_par_to_avcc(AVCodecParameters *par, const AVPacket *key)
     return 1;
 }
 
+static int live_par_to_avcc(AVCodecParameters *par, const AVPacket *key)
+{
+    if (!par)
+        return 0;
+    if (par->codec_id != AV_CODEC_ID_H264 && par->codec_id != AV_CODEC_ID_HEVC)
+        return 0;
+    if (live_extra_is_avcc(par))
+        return 1;
+    if (live_is_annexb(par->extradata, par->extradata_size) &&
+        live_avcc_from_annexb(par, par->extradata, par->extradata_size))
+        return 1;
+    if (key && live_is_annexb(key->data, key->size) &&
+        live_avcc_from_annexb(par, key->data, key->size))
+        return 1;
+    return 0;
+}
+
+static const AVPacket *live_first_video_key(const HttpLivePub *pub);
+
+static int live_fill_avcc(AVCodecParameters *vp, const HttpLivePub *pub)
+{
+    const LiveNode *n;
+    int lists, i;
+
+    if (live_par_to_avcc(vp, live_first_video_key(pub)))
+        return 1;
+    if (!pub)
+        return 0;
+    for (i = 0, lists = 2; i < lists; i++) {
+        for (n = (i ? pub->ready.head : pub->building.head); n; n = n->next) {
+            if (n->st != 0 || !n->pkt || !(n->pkt->flags & AV_PKT_FLAG_KEY))
+                continue;
+            if (live_par_to_avcc(vp, n->pkt))
+                return 1;
+        }
+    }
+    return 0;
+}
+
+static int live_mux_open_vbsf(struct LiveFmtMux *m)
+{
+    const char *name;
+    const AVBitStreamFilter *f;
+    AVStream *st;
+    int ret;
+
+    if (!m || !m->oc || m->v_out < 0)
+        return 0;
+    st = m->oc->streams[m->v_out];
+    if (!st || !st->codecpar)
+        return 0;
+    if (st->codecpar->codec_id == AV_CODEC_ID_H264)
+        name = "h264_mp4toannexb";
+    else if (st->codecpar->codec_id == AV_CODEC_ID_HEVC)
+        name = "hevc_mp4toannexb";
+    else
+        return 0;
+    f = av_bsf_get_by_name(name);
+    if (!f)
+        return 0;
+    ret = av_bsf_alloc(f, &m->vbsf);
+    if (ret < 0)
+        return ret;
+    ret = avcodec_parameters_copy(m->vbsf->par_in, st->codecpar);
+    if (ret < 0)
+        return ret;
+    m->vbsf->time_base_in = st->time_base;
+    return av_bsf_init(m->vbsf);
+}
+
 static int live_pkt_to_avcc(AVPacket *pkt, enum AVCodecID id)
 {
     uint8_t *buf = NULL;
     int size, ret;
 
-    if (!pkt || !live_is_annexb(pkt->data, pkt->size))
+    if (!pkt || live_is_avcc_nal(pkt->data, pkt->size))
+        return 0;
+    if (!live_is_annexb(pkt->data, pkt->size))
         return 0;
     size = pkt->size;
     if (id == AV_CODEC_ID_H264)
@@ -769,15 +923,762 @@ static int live_subscribe(HttpLivePub *pub, LiveSub *sub, int lowdelay)
     return 0;
 }
 
-static int live_write_pkt(AVFormatContext *oc, AVPacket *pkt,
-                          AVRational src_tb, int out_st,
-                          int64_t *off_us, int have_off, int to_avcc,
-                          int to_asc)
+static int live_write_pkt(struct LiveFmtMux *m, AVPacket *pkt,
+                          AVRational src_tb, int out_st, int to_asc);
+
+static int live_fmt_idx(const char *fmt)
 {
+    if (!fmt)
+        return -1;
+    if (!strcmp(fmt, "flv"))
+        return LIVE_FMT_FLV;
+    if (!strcmp(fmt, "mpegts"))
+        return LIVE_FMT_TS;
+    if (!strcmp(fmt, "mp4"))
+        return LIVE_FMT_MP4;
+    return -1;
+}
+
+static void live_notify_workers(HttpLivePub *pub, int type, int fmt_idx)
+{
+    HttpEvMsg msg;
+    int i, n;
+
+    if (!pub)
+        return;
+    msg.type = type;
+    msg.pub_idx = (int)(pub - pubs);
+    msg.fmt_idx = fmt_idx;
+    n = http_ev_nb_workers();
+    for (i = 0; i < n && i < HTTP_EV_MAX; i++) {
+        if (atomic_load(&pub->viewers[i][fmt_idx > 0 ? fmt_idx : 0]) > 0 ||
+            type == HTTP_EV_MSG_GOP_READY) {
+            int f, hit = 0;
+            if (type == HTTP_EV_MSG_GOP_READY) {
+                for (f = 0; f < LIVE_FMT_NB; f++)
+                    if (atomic_load(&pub->viewers[i][f]) > 0)
+                        hit = 1;
+                if (!hit)
+                    continue;
+            } else if (fmt_idx >= 0 &&
+                       atomic_load(&pub->viewers[i][fmt_idx]) <= 0) {
+                continue;
+            }
+            http_ev_post(i, msg);
+        }
+    }
+}
+
+static int live_pub_clients(const HttpLivePub *pub, int *per_fmt)
+{
+    int w, f, n = 0;
+
+    if (per_fmt)
+        memset(per_fmt, 0, LIVE_FMT_NB * sizeof(*per_fmt));
+    if (!pub)
+        return 0;
+    for (f = 0; f < LIVE_FMT_NB; f++) {
+        int c = 0;
+        for (w = 0; w < HTTP_EV_MAX; w++)
+            c += atomic_load(&pub->viewers[w][f]);
+        if (c < 0)
+            c = 0;
+        if (per_fmt)
+            per_fmt[f] = c;
+        n += c;
+    }
+    return n;
+}
+
+static const char *live_codec_log(enum AVCodecID id)
+{
+    const char *n = avcodec_get_name(id);
+
+    if (!n || !n[0] || !strcmp(n, "none"))
+        return "-";
+    if (!strcmp(n, "hevc"))
+        return "h265";
+    return n;
+}
+
+static void live_codec_json(enum AVCodecID id, char *out, int sz)
+{
+    const char *n = avcodec_get_name(id);
+
+    if (!n || !n[0] || !strcmp(n, "none")) {
+        av_strlcpy(out, "", sz);
+        return;
+    }
+    if (!strcmp(n, "h264"))
+        av_strlcpy(out, "H264", sz);
+    else if (!strcmp(n, "hevc"))
+        av_strlcpy(out, "H265", sz);
+    else if (!strcmp(n, "aac"))
+        av_strlcpy(out, "AAC", sz);
+    else if (!strcmp(n, "mp3"))
+        av_strlcpy(out, "MP3", sz);
+    else if (!strcmp(n, "opus"))
+        av_strlcpy(out, "OPUS", sz);
+    else
+        av_strlcpy(out, n, sz);
+}
+
+static void live_refresh_rates_l(HttpLivePub *pub)
+{
+    int64_t now = av_gettime_relative();
+    int64_t dt;
+    uint64_t bv, ba, bo, fv;
+
+    if (!pub)
+        return;
+    dt = pub->rate_t ? now - pub->rate_t
+         : (pub->t_start ? now - pub->t_start : 0);
+    if (dt < 400000 && pub->rate_t)
+        return;
+    if (dt <= 0)
+        dt = 1;
+    bv = atomic_load(&pub->bytes_v);
+    ba = atomic_load(&pub->bytes_a);
+    bo = atomic_load(&pub->bytes_out);
+    fv = atomic_load(&pub->frames_v);
+    if (pub->rate_t) {
+        pub->v_bps  = (int64_t)((bv - pub->prev_bytes_v) * 8000000.0 / dt);
+        pub->a_bps  = (int64_t)((ba - pub->prev_bytes_a) * 8000000.0 / dt);
+        pub->out_bps = (int64_t)((bo - pub->prev_bytes_out) * 8000000.0 / dt);
+        pub->fps    = (fv - pub->prev_frames_v) * 1000000.0 / dt;
+    } else {
+        pub->v_bps  = (int64_t)(bv * 8000000.0 / dt);
+        pub->a_bps  = (int64_t)(ba * 8000000.0 / dt);
+        pub->out_bps = (int64_t)(bo * 8000000.0 / dt);
+        pub->fps    = fv * 1000000.0 / dt;
+    }
+    pub->prev_bytes_v = bv;
+    pub->prev_bytes_a = ba;
+    pub->prev_bytes_out = bo;
+    pub->prev_frames_v = fv;
+    pub->rate_t = now;
+}
+
+static void live_note_media(HttpLivePub *pub, const AVPacket *pkt, int is_video, int is_key)
+{
+    if (!pub || !pkt)
+        return;
+    if (!pub->t_start)
+        pub->t_start = av_gettime_relative();
+    if (is_video) {
+        atomic_fetch_add(&pub->bytes_v, (uint64_t)pkt->size);
+        atomic_fetch_add(&pub->frames_v, 1);
+        if (is_key) {
+            if (pub->last_key_pts != AV_NOPTS_VALUE &&
+                pkt->pts != AV_NOPTS_VALUE &&
+                pub->vtb.num && pub->vtb.den) {
+                int64_t us = av_rescale_q(pkt->pts - pub->last_key_pts,
+                                          pub->vtb, AV_TIME_BASE_Q);
+                if (us > 0 && us < 60LL * AV_TIME_BASE)
+                    pub->gop_us = us;
+            }
+            if (pkt->pts != AV_NOPTS_VALUE)
+                pub->last_key_pts = pkt->pts;
+        }
+    } else {
+        atomic_fetch_add(&pub->bytes_a, (uint64_t)pkt->size);
+    }
+}
+
+static void live_log_stats(void)
+{
+    AVBPrint bp;
+    int i;
+
+    if (!atomic_load(&live_inited))
+        return;
+    av_bprint_init(&bp, 512, AV_BPRINT_SIZE_UNLIMITED);
+    pthread_mutex_lock(&live_mutex);
+    av_bprintf(&bp, "http-live: streams %d", nb_pubs);
+    for (i = 0; i < nb_pubs; i++) {
+        HttpLivePub *pub = &pubs[i];
+        int clients = live_pub_clients(pub, NULL);
+        const char *vc = pub->vpar ? live_codec_log(pub->vpar->codec_id) : "-";
+        const char *ac = pub->apar ? live_codec_log(pub->apar->codec_id) : "-";
+
+        live_refresh_rates_l(pub);
+        av_bprintf(&bp, ", stream %s/%s, %s, %s, gop %.1fs, fps %.0f, clients %d",
+                   pub->app, pub->stream, vc, ac,
+                   pub->gop_us > 0 ? pub->gop_us / 1000000.0 : 0.0,
+                   pub->fps, clients);
+    }
+    pthread_mutex_unlock(&live_mutex);
+    if (av_bprint_is_complete(&bp) && bp.str && bp.str[0]) {
+        char ts[40];
+        int64_t us = av_gettime();
+        time_t sec = (time_t)(us / 1000000);
+        int ms = (int)((us / 1000) % 1000);
+        struct tm tmbuf, *tm;
+#ifdef _WIN32
+        tm = (localtime_s(&tmbuf, &sec) == 0) ? &tmbuf : NULL;
+#else
+        tm = localtime_r(&sec, &tmbuf);
+#endif
+        if (tm)
+            snprintf(ts, sizeof(ts), "%04d-%02d-%02d %02d:%02d:%02d,%03d",
+                     tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday,
+                     tm->tm_hour, tm->tm_min, tm->tm_sec, ms);
+        else
+            snprintf(ts, sizeof(ts), "---- -- -- --:--:--,%03d", ms);
+        /* 先 \n 结束 print_report 的 \r 进度行，整段只打一条 */
+        av_log(NULL, AV_LOG_INFO, "\n([%s] %s\n", ts, bp.str);
+    }
+    av_bprint_finalize(&bp, NULL);
+}
+
+static void *live_stat_thread(void *arg)
+{
+    int i;
+
+    (void)arg;
+    while (atomic_load(&live_stat_on) && atomic_load(&live_running)) {
+        for (i = 0; i < 60; i++) {
+            if (!atomic_load(&live_stat_on) || !atomic_load(&live_running))
+                return NULL;
+            av_usleep(1000000);
+        }
+        if (atomic_load(&live_stat_on) && atomic_load(&live_running))
+            live_log_stats();
+    }
+    return NULL;
+}
+
+static void live_notify_kick(int pub_idx)
+{
+    HttpEvMsg msg = { .type = HTTP_EV_MSG_KICK, .pub_idx = pub_idx, .fmt_idx = -1 };
+    int i, n = http_ev_nb_workers();
+
+    for (i = 0; i < n && i < HTTP_EV_MAX; i++)
+        http_ev_post(i, msg);
+}
+
+static void json_quote(AVBPrint *bp, const char *s)
+{
+    av_bprint_chars(bp, '"', 1);
+    for (; s && *s; s++) {
+        unsigned char c = (unsigned char)*s;
+        if (c == '"' || c == '\\') {
+            av_bprint_chars(bp, '\\', 1);
+            av_bprint_chars(bp, (char)c, 1);
+        } else if (c < 0x20) {
+            av_bprintf(bp, "\\u%04x", c);
+        } else {
+            av_bprint_chars(bp, (char)c, 1);
+        }
+    }
+    av_bprint_chars(bp, '"', 1);
+}
+
+static void live_fmt_dur(char *out, int sz, int64_t sec)
+{
+    int h, m, s;
+
+    if (sec < 0)
+        sec = 0;
+    h = (int)(sec / 3600);
+    m = (int)((sec % 3600) / 60);
+    s = (int)(sec % 60);
+    if (h > 0)
+        snprintf(out, sz, "%dh %dm %ds", h, m, s);
+    else if (m > 0)
+        snprintf(out, sz, "%dm %ds", m, s);
+    else
+        snprintf(out, sz, "%ds", s);
+}
+
+static struct LiveFmtMux *live_mux_from_key(void *opaque)
+{
+    intptr_t key = (intptr_t)opaque;
+    int pidx = (int)(key >> 8), fi = (int)(key & 0xff);
+
+    if (pidx < 0 || pidx >= nb_pubs || fi < 0 || fi >= LIVE_FMT_NB)
+        return NULL;
+    return &pubs[pidx].fmux[fi];
+}
+
+/* Write/seek into the unflushed acc window so FLV tag / moof size patches
+ * still work after the 256KB AVIO buffer has spilled. */
+static int live_mux_avio(void *opaque, const uint8_t *buf, int buf_size)
+{
+    struct LiveFmtMux *m = live_mux_from_key(opaque);
+    uint8_t *nbuf;
+    int need;
+
+    if (!m || buf_size < 0)
+        return AVERROR(EINVAL);
+    if (!buf_size)
+        return 0;
+    need = m->acc_pos + buf_size;
+    if (need > m->acc_sz) {
+        int nsz = FFMAX(need, m->acc_sz * 2 + 4096);
+        nbuf = av_realloc(m->acc, nsz);
+        if (!nbuf)
+            return AVERROR(ENOMEM);
+        m->acc = nbuf;
+        m->acc_sz = nsz;
+    }
+    memcpy(m->acc + m->acc_pos, buf, buf_size);
+    m->acc_pos += buf_size;
+    if (m->acc_pos > m->acc_len)
+        m->acc_len = m->acc_pos;
+    return buf_size;
+}
+
+static int64_t live_mux_avio_seek(void *opaque, int64_t offset, int whence)
+{
+    struct LiveFmtMux *m = live_mux_from_key(opaque);
+    int64_t target, local;
+
+    if (!m)
+        return AVERROR(EINVAL);
+    if (whence == AVSEEK_SIZE)
+        return m->file_pos + m->acc_len;
+    if (whence == SEEK_CUR)
+        offset += m->file_pos + m->acc_pos;
+    else if (whence == SEEK_END)
+        offset += m->file_pos + m->acc_len;
+    else if (whence != SEEK_SET)
+        return AVERROR(EINVAL);
+    target = offset;
+    local = target - m->file_pos;
+    if (local < 0 || local > m->acc_len)
+        return AVERROR(EINVAL);
+    m->acc_pos = (int)local;
+    return target;
+}
+
+static void live_mux_flush_acc(HttpLivePub *pub, int fi, int is_key)
+{
+    struct LiveFmtMux *m = &pub->fmux[fi];
+    HttpLiveBuf *b;
+    unsigned pos;
+
+    if (!m->acc_len)
+        return;
+    b = http_livebuf_alloc(m->acc, m->acc_len, is_key);
+    m->file_pos += m->acc_len;
+    m->acc_len = 0;
+    m->acc_pos = 0;
+    if (!b)
+        return;
+    pos = http_ring_wpos(&m->ring);
+    http_ring_push(&m->ring, b);
+    if (is_key)
+        http_ring_mark_gop(&m->ring, pos);
+    http_livebuf_unref(&b);
+    live_notify_workers(pub, HTTP_EV_MSG_FRAME, fi);
+}
+
+/* Pull ftyp(+moov) off acc before the first moof so every client gets init
+ * even with delay_moov (moov is written on the first fragment, not write_header). */
+static void live_mux_take_mp4_header(struct LiveFmtMux *m)
+{
+    int pos = 0, saw_moov = 0, end;
+
+    if (!m || m->header || m->acc_len < 8)
+        return;
+    while (pos + 8 <= m->acc_len) {
+        uint32_t sz = AV_RB32(m->acc + pos);
+        if (sz < 8 || pos + (int)sz > m->acc_len)
+            return;
+        if (!memcmp(m->acc + pos + 4, "moof", 4) ||
+            !memcmp(m->acc + pos + 4, "mdat", 4)) {
+            if (!saw_moov)
+                return;
+            break;
+        }
+        if (!memcmp(m->acc + pos + 4, "moov", 4))
+            saw_moov = 1;
+        pos += sz;
+    }
+    end = pos;
+    if (!saw_moov || end <= 0)
+        return;
+    m->header = http_livebuf_alloc(m->acc, end, 1);
+    if (end < m->acc_len)
+        memmove(m->acc, m->acc + end, m->acc_len - end);
+    m->acc_len -= end;
+    m->acc_pos = m->acc_len;
+    m->file_pos += end;
+}
+
+/* fMP4 frag_every_frame writes the *previous* sample's moof+mdat during
+ * av_write_frame(current). Mark the ring slot with that previous sample. */
+static void live_mux_commit(HttpLivePub *pub, int fi, int is_key)
+{
+    struct LiveFmtMux *m = &pub->fmux[fi];
+    int slot_key = is_key;
+
+    if (fi == LIVE_FMT_MP4)
+        live_mux_take_mp4_header(m);
+    if (fi == LIVE_FMT_MP4) {
+        if (!m->acc_len) {
+            /* Sample still in movenc; keep the delayed key across audio
+             * packets that produce no bytes. */
+            m->frag_key = m->frag_key || is_key;
+            return;
+        }
+        slot_key = m->frag_key;
+        m->frag_key = is_key;
+    }
+    live_mux_flush_acc(pub, fi, slot_key);
+}
+
+static void live_mux_flush_mp4(HttpLivePub *pub, int fi)
+{
+    struct LiveFmtMux *m = &pub->fmux[fi];
+
+    if (fi != LIVE_FMT_MP4 || !m->oc)
+        return;
+    av_write_frame(m->oc, NULL);
+    if (m->oc->pb)
+        avio_flush(m->oc->pb);
+    live_mux_commit(pub, fi, 0);
+}
+
+/* fMP4 keeps the current sample until the next write. Flush after an IDR so
+ * clients start on this GOP instead of replaying the previous one (fast-forward).
+ * Wait until audio has been muxed so delay_moov does not emit a video-only moov. */
+static void live_mux_emit(HttpLivePub *pub, int fi, int is_key)
+{
+    struct LiveFmtMux *m = &pub->fmux[fi];
+
+    live_mux_commit(pub, fi, is_key);
+    if (fi != LIVE_FMT_MP4 || !is_key || !m->oc)
+        return;
+    if (m->a_out >= 0 && m->last_dts[m->a_out] == AV_NOPTS_VALUE)
+        return;
+    live_mux_flush_mp4(pub, fi);
+}
+
+static void live_mux_free(struct LiveFmtMux *m)
+{
+    if (!m)
+        return;
+    http_ring_clear(&m->ring);
+    http_livebuf_unref(&m->header);
+    av_bsf_free(&m->vbsf);
+    av_freep(&m->acc);
+    m->acc_len = m->acc_sz = m->acc_pos = 0;
+    m->file_pos = 0;
+    m->frag_key = 0;
+    m->to_avcc = m->to_asc = 0;
+    m->have_off = 0;
+    m->ts_off = AV_NOPTS_VALUE;
+    m->last_dts[0] = m->last_dts[1] = AV_NOPTS_VALUE;
+    m->last_dur[0] = m->last_dur[1] = 0;
+    m->v_priming = 0;
+    m->a_priming = 0;
+    m->v_out = m->a_out = -1;
+    if (m->oc) {
+        if (m->oc->pb) {
+            av_freep(&m->oc->pb->buffer);
+            avio_context_free(&m->oc->pb);
+        }
+        avformat_free_context(m->oc);
+        m->oc = NULL;
+        m->pb = NULL;
+        m->iobuf = NULL;
+    }
+}
+
+static int live_mux_enable(HttpLivePub *pub, int fi)
+{
+    struct LiveFmtMux *m;
+    const char *fmt;
+    AVDictionary *opts = NULL;
+    intptr_t key;
+    int ret;
+    LiveNode *n;
+
+    if (atomic_load(&pub->mux_on[fi]))
+        return 0;
+    m = &pub->fmux[fi];
+    live_mux_free(m);
+    fmt = fi == LIVE_FMT_FLV ? "flv" : fi == LIVE_FMT_TS ? "mpegts" : "mp4";
+    m->name = fmt;
+    m->v_out = m->a_out = -1;
+    m->ts_off = AV_NOPTS_VALUE;
+    m->have_off = 0;
+    m->frag_key = 0;
+    m->file_pos = 0;
+    m->last_dts[0] = m->last_dts[1] = AV_NOPTS_VALUE;
+    m->last_dur[0] = m->last_dur[1] = 0;
+    m->v_priming = 0;
+    m->a_priming = 0;
+    http_ring_init(&m->ring);
+    ret = avformat_alloc_output_context2(&m->oc, NULL, fmt, NULL);
+    if (ret < 0 || !m->oc) {
+        live_mux_free(m);
+        return ret < 0 ? ret : AVERROR(ENOMEM);
+    }
+    if (pub->vpar) {
+        AVStream *st = avformat_new_stream(m->oc, NULL);
+        AVCodecParameters *vp = avcodec_parameters_alloc();
+        if (!st || !vp) {
+            avcodec_parameters_free(&vp);
+            live_mux_free(m);
+            return AVERROR(ENOMEM);
+        }
+        avcodec_parameters_copy(vp, pub->vpar);
+        if (live_mux_avcc(fmt)) {
+            if (!live_fill_avcc(vp, pub)) {
+                avcodec_parameters_free(&vp);
+                live_mux_free(m);
+                return AVERROR(EAGAIN);
+            }
+            m->to_avcc = 1;
+        }
+        avcodec_parameters_copy(st->codecpar, vp);
+        st->time_base = pub->vtb.num ? pub->vtb : (AVRational){ 1, 90000 };
+        if (pub->vfr.num && pub->vfr.den) {
+            st->avg_frame_rate = pub->vfr;
+            st->r_frame_rate = pub->vfr;
+        }
+        m->v_out = st->index;
+        if (fi == LIVE_FMT_MP4 && pub->a_pad > 0 && pub->a_rate > 0)
+            m->v_priming = av_rescale_q(pub->a_pad,
+                                        (AVRational){ 1, pub->a_rate },
+                                        st->time_base);
+        avcodec_parameters_free(&vp);
+    }
+    if (pub->apar) {
+        AVStream *st = avformat_new_stream(m->oc, NULL);
+        AVCodecParameters *ap = avcodec_parameters_alloc();
+        const AVPacket *apkt;
+        if (!st || !ap) {
+            avcodec_parameters_free(&ap);
+            live_mux_free(m);
+            return AVERROR(ENOMEM);
+        }
+        avcodec_parameters_copy(ap, pub->apar);
+        apkt = live_first_audio(pub);
+        live_aac_asc_from_adts(ap, apkt);
+        live_aac_ensure_asc(ap);
+        m->to_asc = live_mux_avcc(fmt) && ap->codec_id == AV_CODEC_ID_AAC;
+        avcodec_parameters_copy(st->codecpar, ap);
+        st->time_base = pub->atb.num ? pub->atb : (AVRational){ 1, 48000 };
+        m->a_out = st->index;
+        avcodec_parameters_free(&ap);
+    }
+    if (fi == LIVE_FMT_TS) {
+        ret = live_mux_open_vbsf(m);
+        if (ret < 0) {
+            live_mux_free(m);
+            return ret;
+        }
+    }
+    m->iobuf = av_malloc(LIVE_AVIO_BUF);
+    if (!m->iobuf) {
+        live_mux_free(m);
+        return AVERROR(ENOMEM);
+    }
+    key = ((intptr_t)(pub - pubs) << 8) | fi;
+    m->pb = avio_alloc_context(m->iobuf, LIVE_AVIO_BUF, 1, (void *)key,
+                               NULL, live_mux_avio, live_mux_avio_seek);
+    if (!m->pb) {
+        av_freep(&m->iobuf);
+        live_mux_free(m);
+        return AVERROR(ENOMEM);
+    }
+    /* Keep seekable=0 so muxers do not rewrite already-pushed headers.
+     * live_mux_avio_seek still patches sizes inside the current acc window. */
+    m->pb->seekable = 0;
+    m->oc->pb = m->pb;
+    if (fi != LIVE_FMT_MP4)
+        m->oc->flags |= AVFMT_FLAG_FLUSH_PACKETS;
+    m->oc->max_delay = 0;
+    if (fi == LIVE_FMT_FLV)
+        av_dict_set(&opts, "flvflags", "no_duration_filesize", 0);
+    if (fi == LIVE_FMT_TS) {
+        /* copyts: keep the same A/V clock as FLV. Default mpegts delay
+         * plus starting mid-GOP makes video look ~1s behind audio. */
+        av_dict_set(&opts, "mpegts_flags", "resend_headers+pat_pmt_at_frames", 0);
+        av_dict_set(&opts, "mpegts_copyts", "1", 0);
+    }
+    if (fi == LIVE_FMT_MP4)
+        /* delay_moov: first sample dts need not be 0.
+         * frag_every_frame: GOP-sized moof stalls players every -g.
+         * separate_moof + negative_cts_offsets: HEVC+AAC+B-frames in one
+         * file; cmaf (single-track chunks) leaves video on the first
+         * sample while audio keeps moving. */
+        av_dict_set(&opts, "movflags",
+                    "frag_every_frame+delay_moov+empty_moov+default_base_moof+"
+                    "separate_moof+negative_cts_offsets", 0);
+    av_dict_set(&opts, "flush_packets", "1", 0);
+    ret = avformat_write_header(m->oc, &opts);
+    av_dict_free(&opts);
+    if (ret < 0) {
+        live_mux_free(m);
+        return ret;
+    }
+    /* mpegts forces 90 kHz after write_header. ADTS players skip AAC
+     * priming (FLV does too; fMP4 does not), so audio leads video by
+     * ~40–80ms. Delay audio PTS only on TS. */
+    if (fi == LIVE_FMT_TS && m->a_out >= 0 && pub->a_pad > 0 && pub->a_rate > 0) {
+        AVStream *ast = m->oc->streams[m->a_out];
+        m->a_priming = av_rescale_q(pub->a_pad,
+                                    (AVRational){ 1, pub->a_rate },
+                                    ast->time_base);
+    }
+    avio_flush(m->oc->pb);
+    if (fi == LIVE_FMT_MP4)
+        live_mux_take_mp4_header(m);
+    else if (m->acc_len) {
+        m->header = http_livebuf_alloc(m->acc, m->acc_len, 1);
+        m->file_pos += m->acc_len;
+        m->acc_len = 0;
+        m->acc_pos = 0;
+    }
+    n = pub->building.has_key ? pub->building.head :
+        (pub->ready.head ? pub->ready.head : NULL);
+    for (; n; n = n->next) {
+        AVRational tb = n->st == 0 ? pub->vtb : pub->atb;
+        int out = n->st == 0 ? m->v_out : m->a_out;
+        int pkt_key = n->st == 0 && n->pkt && (n->pkt->flags & AV_PKT_FLAG_KEY);
+        if (!m->have_off && n->pkt && n->pkt->dts != AV_NOPTS_VALUE) {
+            m->ts_off = av_rescale_q(n->pkt->dts, tb, AV_TIME_BASE_Q);
+            m->have_off = 1;
+        }
+        if (live_write_pkt(m, n->pkt, tb, out, n->st == 1 ? m->to_asc : 0) < 0)
+            ffmpeg_http_log(AV_LOG_WARNING,
+                            "http-live: mux %s replay st=%d failed\n",
+                            m->name, n->st);
+        live_mux_emit(pub, fi, pkt_key);
+    }
+    if (fi == LIVE_FMT_MP4) {
+        live_mux_flush_mp4(pub, fi);
+        live_mux_take_mp4_header(m);
+    }
+    atomic_store(&pub->mux_on[fi], 1);
+    live_notify_workers(pub, HTTP_EV_MSG_FRAME, fi);
+    return 0;
+}
+
+static void live_mux_packet(HttpLivePub *pub, const AVPacket *pkt, int st)
+{
+    int fi;
+    AVRational tb = st == 0 ? pub->vtb : pub->atb;
+    int is_key = st == 0 && pkt && (pkt->flags & AV_PKT_FLAG_KEY);
+
+    for (fi = 0; fi < LIVE_FMT_NB; fi++) {
+        struct LiveFmtMux *m = &pub->fmux[fi];
+        int out, was_on;
+        was_on = atomic_load(&pub->mux_on[fi]);
+        if (!was_on && atomic_load(&pub->fmt_want[fi]) > 0)
+            live_mux_enable(pub, fi);
+        if (!atomic_load(&pub->mux_on[fi]) || !m->oc)
+            continue;
+        /* enable() already muxed the current packet as part of GOP replay. */
+        if (!was_on)
+            continue;
+        out = st == 0 ? m->v_out : m->a_out;
+        if (!m->have_off && pkt && pkt->dts != AV_NOPTS_VALUE) {
+            m->ts_off = av_rescale_q(pkt->dts, tb, AV_TIME_BASE_Q);
+            m->have_off = 1;
+        }
+        if (live_write_pkt(m, (AVPacket *)pkt, tb, out, st == 1 ? m->to_asc : 0) < 0)
+            ffmpeg_http_log(AV_LOG_WARNING,
+                            "http-live: mux %s st=%d write failed\n",
+                            m->name, st);
+        live_mux_emit(pub, fi, is_key);
+    }
+}
+
+static int64_t live_default_dur(const AVStream *st)
+{
+    const AVCodecParameters *par;
+    AVRational fr;
+
+    if (!st || !st->codecpar)
+        return 0;
+    par = st->codecpar;
+    if (par->codec_type == AVMEDIA_TYPE_AUDIO && par->sample_rate > 0) {
+        int nb = par->frame_size > 0 ? par->frame_size : 1024;
+        return av_rescale_q(nb, (AVRational){ 1, par->sample_rate }, st->time_base);
+    }
+    if (par->codec_type == AVMEDIA_TYPE_VIDEO) {
+        fr = st->avg_frame_rate.num ? st->avg_frame_rate : st->r_frame_rate;
+        if (fr.num && fr.den)
+            return av_rescale_q(1, av_inv_q(fr), st->time_base);
+    }
+    return 0;
+}
+
+/* copy 音频常和上一包 dts+duration 重叠（AAC priming / 时间基取整），movenc
+ * 会报 Packet duration 为负并把 pts 清掉。缺 pts 时用 dts。重叠则后移，保持 cts。 */
+static void live_sanitize_ts(struct LiveFmtMux *m, AVPacket *out, AVStream *st,
+                             int out_st)
+{
+    int64_t def, min_dts, shift;
+
+    if (out->dts == AV_NOPTS_VALUE && out->pts != AV_NOPTS_VALUE)
+        out->dts = out->pts;
+    if (out->pts == AV_NOPTS_VALUE && out->dts != AV_NOPTS_VALUE)
+        out->pts = out->dts;
+
+    def = live_default_dur(st);
+    if (out->duration < 0)
+        out->duration = 0;
+    if (out->duration <= 0 && def > 0)
+        out->duration = def;
+
+    if (out_st < 0 || out_st > 1)
+        return;
+
+    if (out->dts == AV_NOPTS_VALUE) {
+        if (m->last_dts[out_st] != AV_NOPTS_VALUE)
+            out->dts = m->last_dts[out_st] +
+                       (m->last_dur[out_st] > 0 ? m->last_dur[out_st] : 1);
+        else
+            out->dts = 0;
+        out->pts = out->dts;
+    }
+
+    if (out->dts < 0) {
+        shift = -out->dts;
+        out->dts = 0;
+        if (out->pts != AV_NOPTS_VALUE)
+            out->pts += shift;
+    }
+
+    if (m->last_dts[out_st] != AV_NOPTS_VALUE) {
+        min_dts = m->last_dts[out_st];
+        if (m->last_dur[out_st] > 0)
+            min_dts += m->last_dur[out_st];
+        else
+            min_dts += 1;
+        if (out->dts < min_dts) {
+            shift = min_dts - out->dts;
+            out->dts = min_dts;
+            if (out->pts != AV_NOPTS_VALUE)
+                out->pts += shift;
+            else
+                out->pts = out->dts;
+        }
+    }
+    if (out->pts == AV_NOPTS_VALUE)
+        out->pts = out->dts;
+    m->last_dts[out_st] = out->dts;
+    m->last_dur[out_st] = out->duration > 0 ? out->duration : def;
+}
+
+static int live_write_pkt(struct LiveFmtMux *m, AVPacket *pkt,
+                          AVRational src_tb, int out_st, int to_asc)
+{
+    AVFormatContext *oc;
     AVStream *st;
     AVPacket *out;
     int ret;
 
+    if (!m || !m->oc)
+        return 0;
+    oc = m->oc;
     if (out_st < 0 || out_st >= oc->nb_streams)
         return 0;
     st = oc->streams[out_st];
@@ -785,26 +1686,61 @@ static int live_write_pkt(AVFormatContext *oc, AVPacket *pkt,
     if (!out)
         return AVERROR(ENOMEM);
     out->stream_index = out_st;
-    if (have_off && *off_us != AV_NOPTS_VALUE) {
-        int64_t off = av_rescale_q(*off_us, AV_TIME_BASE_Q, src_tb);
+    if (m->have_off && m->ts_off != AV_NOPTS_VALUE) {
+        int64_t off = av_rescale_q(m->ts_off, AV_TIME_BASE_Q, src_tb);
         if (out->pts != AV_NOPTS_VALUE)
             out->pts -= off;
         if (out->dts != AV_NOPTS_VALUE)
             out->dts -= off;
     }
     av_packet_rescale_ts(out, src_tb, st->time_base);
-    if (to_avcc && st->codecpar &&
+    if (out_st == m->v_out && m->v_priming > 0) {
+        /* AAC encoder delay is not in fMP4; FLV players compensate, MP4 does
+         * not — video looks 40–80ms early. Shift video to match. */
+        if (out->pts != AV_NOPTS_VALUE)
+            out->pts += m->v_priming;
+        if (out->dts != AV_NOPTS_VALUE)
+            out->dts += m->v_priming;
+    }
+    live_sanitize_ts(m, out, st, out_st);
+    /* After sanitize: TS/ADTS players skip AAC priming so audio leads
+     * video by ~a_pad (40–80ms). Delay audio PTS; FLV/MP4 unchanged. */
+    if (out_st == m->a_out && m->a_priming > 0) {
+        if (out->pts != AV_NOPTS_VALUE)
+            out->pts += m->a_priming;
+        if (out->dts != AV_NOPTS_VALUE)
+            out->dts += m->a_priming;
+    }
+    if (st->codecpar && st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO &&
+        out->side_data && out->side_data_elems)
+        av_packet_side_data_remove(out->side_data, &out->side_data_elems,
+                                   AV_PKT_DATA_NEW_EXTRADATA);
+    if (m->vbsf && out_st == m->v_out) {
+        AVPacket *flt = av_packet_alloc();
+        if (!flt) {
+            av_packet_free(&out);
+            return AVERROR(ENOMEM);
+        }
+        ret = av_bsf_send_packet(m->vbsf, out);
+        av_packet_free(&out);
+        if (ret < 0) {
+            av_packet_free(&flt);
+            return ret;
+        }
+        ret = av_bsf_receive_packet(m->vbsf, flt);
+        if (ret < 0) {
+            av_packet_free(&flt);
+            return ret == AVERROR(EAGAIN) ? 0 : ret;
+        }
+        out = flt;
+        out->stream_index = out_st;
+    } else if (m->to_avcc && st->codecpar &&
         st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
         ret = live_pkt_to_avcc(out, st->codecpar->codec_id);
         if (ret < 0) {
             av_packet_free(&out);
             return ret;
         }
-        /* Annex B NEW_EXTRADATA would make flvenc/movenc think the
-         * already-converted AVCC packet is still start-code formatted. */
-        if (out->side_data && out->side_data_elems)
-            av_packet_side_data_remove(out->side_data, &out->side_data_elems,
-                                       AV_PKT_DATA_NEW_EXTRADATA);
     }
     if (to_asc && st->codecpar &&
         st->codecpar->codec_id == AV_CODEC_ID_AAC) {
@@ -972,6 +1908,27 @@ int ffmpeg_http_live_init(void)
         pubs[i].v_src = pubs[i].a_src = -1;
         pubs[i].vtb = (AVRational){ 0, 1 };
         pubs[i].atb = (AVRational){ 0, 1 };
+        pubs[i].vfr = (AVRational){ 0, 1 };
+        pubs[i].a_pad = 0;
+        pubs[i].a_rate = 0;
+        pubs[i].t_start = 0;
+        pubs[i].last_key_pts = AV_NOPTS_VALUE;
+        pubs[i].gop_us = 0;
+        atomic_init(&pubs[i].bytes_v, 0);
+        atomic_init(&pubs[i].bytes_a, 0);
+        atomic_init(&pubs[i].bytes_out, 0);
+        atomic_init(&pubs[i].frames_v, 0);
+        atomic_init(&pubs[i].gop_ready, 0);
+        {
+            int w, f;
+            for (f = 0; f < LIVE_FMT_NB; f++) {
+                atomic_init(&pubs[i].fmt_want[f], 0);
+                atomic_init(&pubs[i].mux_on[f], 0);
+                http_ring_init(&pubs[i].fmux[f].ring);
+                for (w = 0; w < HTTP_EV_MAX; w++)
+                    atomic_init(&pubs[i].viewers[w][f], 0);
+            }
+        }
         ffmpeg_http_log( AV_LOG_INFO,
                "http-live: GOP /%s/%s.flv|.ts|.mp4 <- output file %d\n",
                pubs[i].app, pubs[i].stream, pubs[i].file_index);
@@ -979,6 +1936,10 @@ int ffmpeg_http_live_init(void)
 
     atomic_store(&live_running, 1);
     atomic_store(&live_inited, 1);
+    atomic_store(&live_stat_on, 1);
+    if (!live_stat_started &&
+        !pthread_create(&live_stat_th, NULL, live_stat_thread, NULL))
+        live_stat_started = 1;
     return 0;
 }
 
@@ -996,6 +1957,11 @@ void ffmpeg_http_live_uninit(void)
 {
     int i;
 
+    atomic_store(&live_stat_on, 0);
+    if (live_stat_started) {
+        pthread_join(live_stat_th, NULL);
+        live_stat_started = 0;
+    }
     if (atomic_load(&live_inited)) {
         ffmpeg_http_live_shutdown();
         pthread_mutex_lock(&live_mutex);
@@ -1005,6 +1971,13 @@ void ffmpeg_http_live_uninit(void)
             avcodec_parameters_free(&pubs[i].vpar);
             avcodec_parameters_free(&pubs[i].apar);
             pubs[i].subs = NULL;
+            {
+                int f;
+                for (f = 0; f < LIVE_FMT_NB; f++) {
+                    live_mux_free(&pubs[i].fmux[f]);
+                    atomic_store(&pubs[i].mux_on[f], 0);
+                }
+            }
         }
         pthread_mutex_unlock(&live_mutex);
         atomic_store(&live_inited, 0);
@@ -1087,7 +2060,11 @@ void ffmpeg_http_live_push(const OutputFile *of, const OutputStream *ost,
         }
         if (pub->building.count > LIVE_GOP_MAX_PKTS && pub->building.has_key)
             live_rotate_gop(pub);
+        live_note_media(pub, owned, is_video, is_key);
         live_fanout(pub, owned, st);
+        if (live_gop_cached(pub) && !atomic_exchange(&pub->gop_ready, 1))
+            live_notify_workers(pub, HTTP_EV_MSG_GOP_READY, 0);
+        live_mux_packet(pub, owned, st);
     }
     pthread_cond_broadcast(&live_cond);
 unlock:
@@ -1101,289 +2078,356 @@ int ffmpeg_http_live_serve(void *http_conn, const char *fmt,
     void *c = http_conn;
     const char *peer = ffmpeg_http_conn_peer(c);
     HttpLivePub *pub;
-    LiveAvio avio_ctx = { .conn = c, .started = 0 };
-    LiveSub sub;
-    AVFormatContext *oc = NULL;
-    AVIOContext *pb = NULL;
-    unsigned char *iobuf = NULL;
-    AVCodecParameters *vpar = NULL, *apar = NULL;
-    AVPacket *key = NULL, *apkt = NULL;
-    AVRational vtb = { 0, 1 }, atb = { 0, 1 };
-    AVDictionary *opts = NULL;
-    int64_t ts_off = AV_NOPTS_VALUE;
-    int have_off = 0;
-    int v_out = -1, a_out = -1;
-    int ret, wait_ret, wait_ms, to_avcc = 0, to_asc = 0;
-    int64_t t_wait;
+    struct LiveFmtMux *m;
+    HttpLiveBuf *b = NULL;
+    int fi, wid, ret = 0, wait_ms;
+    int64_t t_wait, deadline;
+    unsigned rpos;
     const char *why = "ok";
+    int wait_key;
 
-    memset(&sub, 0, sizeof(sub));
     if (!c || !fmt || !mime)
         return AVERROR(EINVAL);
-    if (!ffmpeg_http_live_enabled() || pub_idx < 0 || pub_idx >= nb_pubs) {
+    fi = live_fmt_idx(fmt);
+    wid = ffmpeg_http_conn_worker_id(c);
+    if (wid < 0 || wid >= HTTP_EV_MAX)
+        wid = 0;
+    if (!ffmpeg_http_live_enabled() || pub_idx < 0 || pub_idx >= nb_pubs || fi < 0) {
         ffmpeg_http_conn_note(c, "live-off");
         return live_send_status(c, 503, "Live publisher off");
     }
     pub = &pubs[pub_idx];
+    m = &pub->fmux[fi];
     if (accept_us <= 0)
         accept_us = av_gettime_relative();
-    ffmpeg_http_log( AV_LOG_INFO, "http-live: [%s] connect /%s/%s %s%s req=%dms\n",
+    ffmpeg_http_log(AV_LOG_INFO, "http-live: [%s] connect /%s/%s %s%s req=%dms\n",
            peer, pub->app, pub->stream, fmt, lowdelay ? " lowdelay" : "",
            (int)((av_gettime_relative() - accept_us) / 1000));
 
+    ffmpeg_http_conn_mark_live(c, pub_idx);
+    atomic_fetch_add(&pub->viewers[wid][fi], 1);
+    atomic_fetch_add(&pub->fmt_want[fi], 1);
+
     t_wait = av_gettime_relative();
-    pthread_mutex_lock(&live_mutex);
-    wait_ret = live_wait_ready(pub, head_only, lowdelay);
-    if (wait_ret >= 0 && pub->vpar) {
-        const AVPacket *src;
-
-        vpar = avcodec_parameters_alloc();
-        if (vpar)
-            avcodec_parameters_copy(vpar, pub->vpar);
-        vtb = pub->vtb;
-        if (pub->apar) {
-            apar = avcodec_parameters_alloc();
-            if (apar)
-                avcodec_parameters_copy(apar, pub->apar);
-            atb = pub->atb;
+    deadline = t_wait + (pub->vpar ? 2000000LL : LIVE_WAIT_PAR_US);
+    while (atomic_load(&live_running) && !atomic_load(&pub->gop_ready) &&
+           !(head_only && pub->vpar) && !lowdelay) {
+        if (ffmpeg_http_conn_kicked(c)) {
+            why = "kicked";
+            goto out;
         }
-        if (!head_only) {
-            src = live_first_video_key(pub);
-            if (live_mux_avcc(fmt) && src)
-                key = av_packet_clone(src);
-            src = live_first_audio(pub);
-            if (src)
-                apkt = av_packet_clone(src);
-        }
+        if (av_gettime_relative() >= deadline)
+            break;
+        ffmpeg_http_conn_wait_msg(c);
+        while (ffmpeg_http_conn_got_msg(c, NULL, NULL, NULL))
+            ;
     }
-    pthread_mutex_unlock(&live_mutex);
     wait_ms = (int)((av_gettime_relative() - t_wait) / 1000);
-
-    if (live_mux_avcc(fmt) && vpar) {
-        ret = live_par_to_avcc(vpar, key);
-        if (ret < 0)
-            ffmpeg_http_log( AV_LOG_WARNING,
-                   "http-live: [%s] AVCC extra from IDR failed: %s\n",
-                   peer, av_err2str(ret));
-        to_avcc = live_extra_is_avcc(vpar);
-        if (!to_avcc)
-            ffmpeg_http_log( AV_LOG_WARNING,
-                   "http-live: [%s] no AVCC extra; FLV/MP4 may mis-parse Annex B\n",
-                   peer);
-    }
-    av_packet_free(&key);
-    if (apar) {
-        ret = live_aac_asc_from_adts(apar, apkt);
-        if (ret < 0)
-            ffmpeg_http_log( AV_LOG_WARNING,
-                   "http-live: [%s] AAC ASC from ADTS failed: %s\n",
-                   peer, av_err2str(ret));
-        ret = live_aac_ensure_asc(apar);
-        if (ret < 0)
-            ffmpeg_http_log( AV_LOG_WARNING,
-                   "http-live: [%s] AAC ASC extra failed: %s\n",
-                   peer, av_err2str(ret));
-        else if (!strcmp(fmt, "mpegts") &&
-                 apar->codec_id == AV_CODEC_ID_AAC && !apar->extradata_size)
-            ffmpeg_http_log( AV_LOG_WARNING,
-                   "http-live: [%s] AAC extra still empty; TS needs ADTS or ASC\n",
-                   peer);
-        to_asc = live_mux_avcc(fmt) && apar->codec_id == AV_CODEC_ID_AAC;
-    }
-    av_packet_free(&apkt);
-
-    if (wait_ret < 0 || !vpar) {
+    if (!head_only && !lowdelay && !atomic_load(&pub->gop_ready) && !pub->vpar) {
         why = "gop-not-ready";
-        ffmpeg_http_log( AV_LOG_WARNING,
-               "http-live: [%s] GOP not ready wait=%dms cache=%s vpar=%d extra=%d\n",
-               peer, wait_ms, live_cache_name(pub), pub->vpar ? 1 : 0,
-               pub->vpar ? pub->vpar->extradata_size : 0);
-        avcodec_parameters_free(&vpar);
-        avcodec_parameters_free(&apar);
-        ffmpeg_http_conn_note(c, why);
-        ffmpeg_http_log( AV_LOG_INFO,
-               "http-live: [%s] disconnect /%s/%s reason=%s dur=%dms bytes=%"PRId64"\n",
-               peer, pub->app, pub->stream, why,
-               (int)((av_gettime_relative() - accept_us) / 1000),
-               ffmpeg_http_conn_bytes(c));
-        return live_send_status(c, 503, "Live GOP not ready");
+        ffmpeg_http_log(AV_LOG_WARNING,
+               "http-live: [%s] GOP not ready wait=%dms cache=%s\n",
+               peer, wait_ms, live_cache_name(pub));
+        live_send_status(c, 503, "Live GOP not ready");
+        goto out;
     }
-
-    ffmpeg_http_log( AV_LOG_INFO,
-           "http-live: [%s] gop ready wait=%dms cache=%s extra=%d (no wait extradata/next-IDR)\n",
-           peer, wait_ms, live_cache_name(pub), vpar->extradata_size);
+    ffmpeg_http_log(AV_LOG_INFO,
+           "http-live: [%s] gop ready wait=%dms cache=%s extra=%d\n",
+           peer, wait_ms, live_cache_name(pub),
+           pub->vpar ? pub->vpar->extradata_size : 0);
     if (live_send_ok_hdr(c, mime) < 0) {
         why = "write-200";
-        ffmpeg_http_log( AV_LOG_ERROR, "http-live: [%s] write 200 failed\n", peer);
-        avcodec_parameters_free(&vpar);
-        avcodec_parameters_free(&apar);
-        ffmpeg_http_conn_note(c, why);
-        ffmpeg_http_log( AV_LOG_INFO,
-               "http-live: [%s] disconnect /%s/%s reason=%s dur=%dms bytes=%"PRId64"\n",
-               peer, pub->app, pub->stream, why,
-               (int)((av_gettime_relative() - accept_us) / 1000),
-               ffmpeg_http_conn_bytes(c));
-        return AVERROR(EIO);
+        goto out;
     }
-    ffmpeg_http_log( AV_LOG_INFO, "http-live: [%s] http 200 %s\n", peer, mime);
+    ffmpeg_http_log(AV_LOG_INFO, "http-live: [%s] http 200 %s\n", peer, mime);
     if (head_only) {
         why = "head";
-        avcodec_parameters_free(&vpar);
-        avcodec_parameters_free(&apar);
-        ffmpeg_http_conn_note(c, why);
-        ffmpeg_http_log( AV_LOG_INFO,
-               "http-live: [%s] disconnect /%s/%s reason=%s dur=%dms bytes=%"PRId64"\n",
-               peer, pub->app, pub->stream, why,
-               (int)((av_gettime_relative() - accept_us) / 1000),
-               ffmpeg_http_conn_bytes(c));
-        return 0;
+        goto out;
     }
 
-    ret = avformat_alloc_output_context2(&oc, NULL, fmt, NULL);
-    if (ret < 0 || !oc)
-        goto fail;
-
-    if (vpar) {
-        AVStream *st = avformat_new_stream(oc, NULL);
-        if (!st) {
-            ret = AVERROR(ENOMEM);
-            goto fail;
+    deadline = av_gettime_relative() + 2000000LL;
+    while (atomic_load(&live_running) && !atomic_load(&pub->mux_on[fi])) {
+        if (ffmpeg_http_conn_kicked(c)) {
+            why = "kicked";
+            goto out;
         }
-        ret = avcodec_parameters_copy(st->codecpar, vpar);
-        if (ret < 0)
-            goto fail;
-        st->time_base = vtb.num ? vtb : (AVRational){ 1, 90000 };
-        v_out = st->index;
-    }
-    if (apar) {
-        AVStream *st = avformat_new_stream(oc, NULL);
-        if (!st) {
-            ret = AVERROR(ENOMEM);
-            goto fail;
+        if (av_gettime_relative() >= deadline) {
+            why = "mux-timeout";
+            goto out;
         }
-        ret = avcodec_parameters_copy(st->codecpar, apar);
-        if (ret < 0)
-            goto fail;
-        st->time_base = atb.num ? atb : (AVRational){ 1, 48000 };
-        a_out = st->index;
+        ffmpeg_http_conn_wait_msg(c);
+        while (ffmpeg_http_conn_got_msg(c, NULL, NULL, NULL))
+            ;
     }
-
-    iobuf = av_malloc(LIVE_AVIO_BUF);
-    if (!iobuf) {
-        ret = AVERROR(ENOMEM);
-        goto fail;
+    if (!atomic_load(&pub->mux_on[fi])) {
+        why = "mux-off";
+        goto out;
     }
-    pb = avio_alloc_context(iobuf, LIVE_AVIO_BUF, 1, &avio_ctx,
-                            NULL, live_avio_write, NULL);
-    if (!pb) {
-        av_freep(&iobuf);
-        ret = AVERROR(ENOMEM);
-        goto fail;
+    ffmpeg_http_log(AV_LOG_INFO, "http-live: [%s] mux header ok\n", peer);
+    if (m->header && ffmpeg_http_conn_write(c, m->header->data, m->header->size) < 0) {
+        why = ffmpeg_http_conn_kicked(c) ? "kicked" : "write-fail";
+        goto out;
     }
-    pb->seekable = 0;
-    oc->pb = pb;
-    oc->flags |= AVFMT_FLAG_FLUSH_PACKETS;
-
-    if (!strcmp(fmt, "mp4"))
-        av_dict_set(&opts, "movflags",
-                    "frag_keyframe+empty_moov+default_base_moof", 0);
-    av_dict_set(&opts, "flush_packets", "1", 0);
-
-    ret = avformat_write_header(oc, &opts);
-    av_dict_free(&opts);
-    if (ret < 0) {
-        ffmpeg_http_log( AV_LOG_ERROR, "http-live: [%s] write_header %s failed: %s\n",
-               peer, fmt, av_err2str(ret));
-        goto fail;
+    if (m->header)
+        atomic_fetch_add(&pub->bytes_out, (uint64_t)m->header->size);
+    wait_key = 1;
+    if (lowdelay) {
+        rpos = http_ring_wpos(&m->ring);
+        wait_key = 1;
+    } else {
+        rpos = http_ring_valid_gop(&m->ring);
+        /* TS used to start at oldest when no GOP mark was seen. Audio played
+         * immediately while video waited for the next IDR (~1s / half GOP). */
+        if (rpos == http_ring_wpos(&m->ring))
+            wait_key = 1;
     }
-    avio_flush(oc->pb);
-    ffmpeg_http_log( AV_LOG_INFO, "http-live: [%s] mux header ok\n", peer);
-
-    pthread_mutex_lock(&live_mutex);
-    ret = live_subscribe(pub, &sub, lowdelay);
-    pthread_mutex_unlock(&live_mutex);
-    if (ret < 0) {
-        why = "subscribe-fail";
-        ffmpeg_http_log( AV_LOG_WARNING, "http-live: [%s] subscribe failed: %s\n",
-               peer, av_err2str(ret));
-        av_write_trailer(oc);
-        goto fail;
-    }
-
-    ffmpeg_http_log( AV_LOG_INFO,
+    ffmpeg_http_log(AV_LOG_INFO,
            "http-live: [%s] streaming /%s/%s %s%s setup=%dms wait=%dms\n",
            peer, pub->app, pub->stream, fmt, lowdelay ? " lowdelay" : "",
            (int)((av_gettime_relative() - accept_us) / 1000), wait_ms);
 
     while (atomic_load(&live_running)) {
-        LiveList batch;
-        LiveNode *n;
-        int overflow;
-
-        memset(&batch, 0, sizeof(batch));
-        pthread_mutex_lock(&live_mutex);
-        while (atomic_load(&live_running) && !sub.q.head && !sub.overflow)
-            pthread_cond_wait(&live_cond, &live_mutex);
-        overflow = sub.overflow;
-        batch = sub.q;
-        memset(&sub.q, 0, sizeof(sub.q));
-        pthread_mutex_unlock(&live_mutex);
-
-        if (overflow) {
-            live_list_free(&batch);
+        if (ffmpeg_http_conn_kicked(c)) {
+            why = "kicked";
+            goto out;
+        }
+        if (http_ring_stale(&m->ring, rpos)) {
+            unsigned jump = http_ring_valid_gop(&m->ring);
+            ffmpeg_http_log(AV_LOG_WARNING,
+                   "http-live: [%s] client lagged, skip GOP rpos=%u -> %u w=%u\n",
+                   peer, rpos, jump, http_ring_wpos(&m->ring));
+            rpos = jump;
+            wait_key = 1;
             why = "lagged";
-            ffmpeg_http_log( AV_LOG_WARNING, "http-live: [%s] client lagged, drop\n",
-                   peer);
-            break;
         }
-        for (n = batch.head; n; n = n->next) {
-            AVRational tb = n->st == 0 ? vtb : atb;
-            int out_st = n->st == 0 ? v_out : a_out;
-
-            if (!have_off && n->pkt->dts != AV_NOPTS_VALUE) {
-                ts_off = av_rescale_q(n->pkt->dts, tb, AV_TIME_BASE_Q);
-                have_off = 1;
+        while (!http_ring_stale(&m->ring, rpos) && rpos < http_ring_wpos(&m->ring)) {
+            b = http_ring_get(&m->ring, rpos);
+            if (!b) {
+                if (http_ring_stale(&m->ring, rpos))
+            break;
+                rpos++;
+                continue;
             }
-            ret = live_write_pkt(oc, n->pkt, tb, out_st, &ts_off, have_off,
-                                 n->st == 0 ? to_avcc : 0,
-                                 n->st == 1 ? to_asc : 0);
-            if (ret < 0)
-                break;
+            rpos++;
+            if (wait_key && !b->is_key) {
+                http_livebuf_unref(&b);
+                continue;
+            }
+            wait_key = 0;
+            ret = ffmpeg_http_conn_write(c, b->data, b->size);
+            if (ret >= 0)
+                atomic_fetch_add(&pub->bytes_out, (uint64_t)b->size);
+            http_livebuf_unref(&b);
+            if (ret < 0) {
+                why = ffmpeg_http_conn_kicked(c) ? "kicked" : "write-fail";
+                goto out;
+            }
         }
-        live_list_free(&batch);
-        if (ret < 0) {
-            why = "write-fail";
+        if (!atomic_load(&live_running))
             break;
-        }
+        ffmpeg_http_conn_wait_msg(c);
+        while (ffmpeg_http_conn_got_msg(c, NULL, NULL, NULL))
+            ;
     }
     if (!strcmp(why, "ok") && !atomic_load(&live_running))
         why = "shutdown";
-
-    av_write_trailer(oc);
-    ret = 0;
-
-fail:
-    if (!strcmp(why, "ok") && ret < 0)
-        why = "setup-fail";
-    pthread_mutex_lock(&live_mutex);
-    live_sub_detach(&sub);
-    pthread_mutex_unlock(&live_mutex);
-
-    ffmpeg_http_log( AV_LOG_INFO,
+out:
+    atomic_fetch_sub(&pub->viewers[wid][fi], 1);
+    atomic_fetch_sub(&pub->fmt_want[fi], 1);
+    ffmpeg_http_log(AV_LOG_INFO,
            "http-live: [%s] disconnect /%s/%s reason=%s dur=%dms bytes=%"PRId64"\n",
            peer, pub->app, pub->stream, why,
            (int)((av_gettime_relative() - accept_us) / 1000),
            ffmpeg_http_conn_bytes(c));
     ffmpeg_http_conn_note(c, why);
-
-    if (oc) {
-        if (oc->pb) {
-            av_freep(&oc->pb->buffer);
-            avio_context_free(&oc->pb);
-        }
-        avformat_free_context(oc);
-    }
-    avcodec_parameters_free(&vpar);
-    avcodec_parameters_free(&apar);
     return ret;
+}
+
+static int live_audio_channels(const AVCodecParameters *par)
+{
+    if (!par)
+        return 0;
+    return par->ch_layout.nb_channels;
+}
+
+static int live_collect_idxs(const char *spec, int all, int *idxs, int max)
+{
+    char buf[1024], *tok, *save = NULL;
+    int n = 0, i, j;
+
+    if (all || (spec && (!strcmp(spec, "all") || !strcmp(spec, "*")))) {
+        for (i = 0; i < nb_pubs && n < max; i++)
+            idxs[n++] = i;
+        return n;
+    }
+    if (!spec || !spec[0] || !idxs || max <= 0)
+        return 0;
+    av_strlcpy(buf, spec, sizeof(buf));
+    for (tok = av_strtok(buf, ",; \t", &save); tok && n < max;
+         tok = av_strtok(NULL, ",; \t", &save)) {
+        HttpLivePub *pub;
+        char app[128], stream[128];
+        char *slash;
+
+        while (*tok == '/')
+            tok++;
+        if (!tok[0])
+            continue;
+        slash = strchr(tok, '/');
+        if (slash && slash != tok && slash[1]) {
+            av_strlcpy(app, tok, sizeof(app));
+            app[FFMIN((int)(slash - tok), (int)sizeof(app) - 1)] = 0;
+            av_strlcpy(stream, slash + 1, sizeof(stream));
+            pub = live_find_pub(app, stream);
+            if (pub) {
+                int idx = (int)(pub - pubs);
+                for (j = 0; j < n; j++)
+                    if (idxs[j] == idx)
+                break;
+                if (j == n)
+                    idxs[n++] = idx;
+            }
+        } else {
+            for (i = 0; i < nb_pubs && n < max; i++) {
+                if (strcmp(pubs[i].stream, tok))
+                    continue;
+                for (j = 0; j < n; j++)
+                    if (idxs[j] == i)
+            break;
+                if (j == n)
+                    idxs[n++] = i;
+            }
+        }
+    }
+    return n;
+}
+
+int ffmpeg_http_live_stat_json(char **out)
+{
+    AVBPrint bp;
+    int i;
+
+    if (!out)
+        return AVERROR(EINVAL);
+    *out = NULL;
+    av_bprint_init(&bp, 2048, AV_BPRINT_SIZE_UNLIMITED);
+    pthread_mutex_lock(&live_mutex);
+    av_bprintf(&bp, "{\"code\":0,\"streams\":%d,\"data\":[", nb_pubs);
+    for (i = 0; i < nb_pubs; i++) {
+        HttpLivePub *pub = &pubs[i];
+        char vc[32] = "", ac[32] = "", schema[280], dur[32];
+        int pf[LIVE_FMT_NB] = {0};
+        int clients, ch = 0, sr = 0, w = 0, h = 0, proto_n = 0;
+        int64_t now = av_gettime_relative();
+        int64_t dur_s = pub->t_start ? (now - pub->t_start) / 1000000 : 0;
+        uint64_t bin;
+
+        live_refresh_rates_l(pub);
+        clients = live_pub_clients(pub, pf);
+        if (pub->vpar) {
+            live_codec_json(pub->vpar->codec_id, vc, sizeof(vc));
+            w = pub->vpar->width;
+            h = pub->vpar->height;
+        }
+        if (pub->apar) {
+            live_codec_json(pub->apar->codec_id, ac, sizeof(ac));
+            sr = pub->apar->sample_rate;
+            ch = live_audio_channels(pub->apar);
+        }
+        snprintf(schema, sizeof(schema), "%s/%s", pub->app, pub->stream);
+        live_fmt_dur(dur, sizeof(dur), dur_s);
+        bin = atomic_load(&pub->bytes_v) + atomic_load(&pub->bytes_a);
+        if (i)
+            av_bprint_chars(&bp, ',', 1);
+        av_bprintf(&bp, "{\"app\":");
+        json_quote(&bp, pub->app);
+        av_bprintf(&bp, ",\"stream\":");
+        json_quote(&bp, pub->stream);
+        av_bprintf(&bp, ",\"schema\":");
+        json_quote(&bp, schema);
+        av_bprintf(&bp,
+                   ",\"video_codec\":\"%s\",\"width\":%d,\"height\":%d,"
+                   "\"fps\":%.2f,\"gop\":%.2f,\"video_bitrate\":%"PRId64","
+                   "\"audio_codec\":\"%s\",\"sample_rate\":%d,\"channels\":%d,"
+                   "\"audio_bitrate\":%"PRId64","
+                   "\"bitrate_in\":%"PRId64",\"bitrate_out\":%"PRId64","
+                   "\"bytes_in\":%"PRIu64",\"bytes_out\":%"PRIu64","
+                   "\"status\":\"%s\",\"duration\":%"PRId64",\"duration_str\":\"%s\","
+                   "\"clients\":%d,\"clients_flv\":%d,\"clients_ts\":%d,\"clients_mp4\":%d,"
+                   "\"protocols\":[",
+                   vc, w, h, pub->fps,
+                   pub->gop_us > 0 ? pub->gop_us / 1000000.0 : 0.0,
+                   pub->v_bps, ac, sr, ch, pub->a_bps,
+                   pub->v_bps + pub->a_bps, pub->out_bps,
+                   bin, (uint64_t)atomic_load(&pub->bytes_out),
+                   atomic_load(&pub->gop_ready) ? "active" :
+                       (pub->t_start ? "wait" : "idle"),
+                   dur_s, dur, clients, pf[LIVE_FMT_FLV], pf[LIVE_FMT_TS],
+                   pf[LIVE_FMT_MP4]);
+        if (atomic_load(&pub->mux_on[LIVE_FMT_FLV]) || pf[LIVE_FMT_FLV] > 0) {
+            av_bprintf(&bp, "%s\"flv\"", proto_n ? "," : "");
+            proto_n++;
+        }
+        if (atomic_load(&pub->mux_on[LIVE_FMT_TS]) || pf[LIVE_FMT_TS] > 0) {
+            av_bprintf(&bp, "%s\"ts\"", proto_n ? "," : "");
+            proto_n++;
+        }
+        if (atomic_load(&pub->mux_on[LIVE_FMT_MP4]) || pf[LIVE_FMT_MP4] > 0) {
+            av_bprintf(&bp, "%s\"fmp4\"", proto_n ? "," : "");
+            proto_n++;
+        }
+        av_bprintf(&bp, "]}");
+    }
+    av_bprintf(&bp, "]}");
+    pthread_mutex_unlock(&live_mutex);
+    if (!av_bprint_is_complete(&bp)) {
+        av_bprint_finalize(&bp, NULL);
+        return AVERROR(ENOMEM);
+    }
+    return av_bprint_finalize(&bp, out);
+}
+
+int ffmpeg_http_live_kick(const char *spec, int all, char **out)
+{
+    AVBPrint bp;
+    int idxs[64], n, i, kicked = 0;
+
+    if (!out)
+        return AVERROR(EINVAL);
+    *out = NULL;
+    if (!atomic_load(&live_inited)) {
+        av_bprint_init(&bp, 128, AV_BPRINT_SIZE_UNLIMITED);
+        av_bprintf(&bp, "{\"code\":-1,\"kicked\":0,\"error\":\"live off\",\"streams\":[]}");
+        return av_bprint_finalize(&bp, out);
+    }
+    pthread_mutex_lock(&live_mutex);
+    n = live_collect_idxs(spec, all, idxs, FF_ARRAY_ELEMS(idxs));
+    av_bprint_init(&bp, 256, AV_BPRINT_SIZE_UNLIMITED);
+    av_bprintf(&bp, "{\"code\":%d,\"kicked\":", (n > 0 || all) ? 0 : -2);
+    for (i = 0; i < n; i++)
+        kicked += live_pub_clients(&pubs[idxs[i]], NULL);
+    av_bprintf(&bp, "%d,\"streams\":[", kicked);
+    for (i = 0; i < n; i++) {
+        char schema[280];
+        snprintf(schema, sizeof(schema), "%s/%s",
+                 pubs[idxs[i]].app, pubs[idxs[i]].stream);
+        if (i)
+            av_bprint_chars(&bp, ',', 1);
+        json_quote(&bp, schema);
+        live_notify_kick(idxs[i]);
+        ffmpeg_http_log(AV_LOG_WARNING,
+               "http-live: kick %s/%s clients=%d\n",
+               pubs[idxs[i]].app, pubs[idxs[i]].stream,
+               live_pub_clients(&pubs[idxs[i]], NULL));
+    }
+    if (n <= 0 && !all)
+        av_bprintf(&bp, "],\"error\":\"not found\"}");
+    else
+        av_bprintf(&bp, "]}");
+    pthread_mutex_unlock(&live_mutex);
+    if (!av_bprint_is_complete(&bp)) {
+        av_bprint_finalize(&bp, NULL);
+        return AVERROR(ENOMEM);
+    }
+    return av_bprint_finalize(&bp, out);
 }

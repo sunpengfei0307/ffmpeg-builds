@@ -626,6 +626,8 @@ OBJS-$(CONFIG_CELLAUTO_FILTER)               += vsrc_cellauto.o
 OBJS-$(CONFIG_COLOR_FILTER)                  += vsrc_testsrc.o
 OBJS-$(CONFIG_COLOR_CUDA_FILTER)             += vsrc_color_cuda.o vsrc_color_cuda.ptx.o \
                                                 cuda/load_helper.o
+OBJS-$(CONFIG_CLOCK_CUDA_FILTER)             += vsrc_clock_cuda.o vsrc_clock_cuda.ptx.o \
+                                                cuda/load_helper.o
 OBJS-$(CONFIG_COLORCHART_FILTER)             += vsrc_testsrc.o
 OBJS-$(CONFIG_COLORSPECTRUM_FILTER)          += vsrc_testsrc.o
 OBJS-$(CONFIG_COREIMAGESRC_FILTER)           += vf_coreimage.o
