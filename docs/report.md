@@ -6,6 +6,7 @@
 
 | 日期 | 说明 |
 |------|------|
+| 2026-09-23 | 文件与控制台同一级别：默认 INFO；`-loglevel` 两边一起变。仅 `FFREPORT=level=` 单独钉文件级别 |
 | 2026-09-02 | `-report` 可带前缀：生成 `前缀-YYYYMMDD-HHMMSS.log`；不带参数仍为当前目录 `ffmpeg-时间.log` |
 
 ## 用法
@@ -30,7 +31,9 @@
 
 ## 与 `FFREPORT` 的关系
 
-环境变量 `FFREPORT=file=模板:level=数字` 仍可用（`%p`=程序名，`%t`=时间）。同时写 `-report 前缀` 时，**以前缀文件名为准**，`level=` 仍生效。
+环境变量 `FFREPORT=file=模板:level=数字` 仍可用（`%p`=程序名，`%t`=时间）。同时写 `-report 前缀` 时，**以前缀文件名为准**。
+
+未写 `level=` 时，文件只收录控制台同一级别的行（默认 **INFO**，数值 32）。`-loglevel verbose|debug` 后文件也会变详细；`-loglevel warning` 则两边都少打。只有 `FFREPORT=…:level=48` 这类显式 `level=` 才会让文件和控制台不一致。启动行 `Log level:` 是当时的文件阈值。
 
 ## 注意事项
 

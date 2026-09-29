@@ -1,282 +1,244 @@
 /*
- * mixing_cuda built-in layouts: equal gallery + speaker spotlight.
+ * 16:9 preset layouts. Numbers follow the director console
+ * layoutGeometry() in landscape mode (portrait presets are not included).
  *
- * Speaker obs (1080p ref): main 1432x806, thumb 468x256, gap 16px;
- * right column top/bottom aligned with main. Other canvases scale by
- * out_w/1920 and out_h/1080.
+ * gap is a 1080p pixel inset converted with gx = gap/1920*100, gy = gap/1080*100.
+ * Default gaps: single 0, split2/split2h/grid4 16, pip/pip_tl/left3/grid6 12,
+ * speaker 8, grid3 14, grid9 10, grid16 8.
  */
 
 #include "vf_mixing_cuda_layout.h"
 
 #include <math.h>
+#include <string.h>
 
+#include "libavutil/avstring.h"
 #include "libavutil/common.h"
 
-#define REF_W         1920
-#define REF_H         1080
-#define REF_MAIN_W    1432
-#define REF_MAIN_H    806
-#define REF_THUMB_W   468
-#define REF_THUMB_H   256
-#define REF_GAP       16
+#define REF_W 1920.0
+#define REF_H 1080.0
 
-/* Equal gallery: outer pad + cell gap (px on 1080p, then scaled). */
-#define LAY_PAD       8
-#define LAY_GAP       16
-
-static void canvas_size(int *w, int *h)
+static void gap_pct(int gap_px, double *gx, double *gy)
 {
-    if (*w <= 0)
-        *w = REF_W;
-    if (*h <= 0)
-        *h = REF_H;
+    double px = gap_px > 0 ? (double)gap_px : 0.0;
+    *gx = px / REF_W * 100.0;
+    *gy = px / REF_H * 100.0;
 }
 
-static int sx(int ref, int out_w)
-{
-    return FFMAX(2, (ref * out_w + REF_W / 2) / REF_W);
-}
-
-static int sy(int ref, int out_h)
-{
-    return FFMAX(2, (ref * out_h + REF_H / 2) / REF_H);
-}
-
-static float pct_x(int px, int out_w)
-{
-    return 100.f * (float)px / (float)out_w;
-}
-
-static float pct_y(int px, int out_h)
-{
-    return 100.f * (float)px / (float)out_h;
-}
-
-static MixingLayoutRect rect_px(int x, int y, int w, int h, int out_w, int out_h)
+static MixingLayoutRect box(double x, double y, double w, double h,
+                            double gx, double gy)
 {
     MixingLayoutRect r;
-    r.x = pct_x(x, out_w);
-    r.y = pct_y(y, out_h);
-    r.w = pct_x(w, out_w);
-    r.h = pct_y(h, out_h);
+    r.x = (float)(x + gx / 2.0);
+    r.y = (float)(y + gy / 2.0);
+    r.w = (float)fmax(0.5, w - gx);
+    r.h = (float)fmax(0.5, h - gy);
     return r;
 }
 
-/* Optimal cols×rows so cols/rows is closest to 16:9 (HTML calcGrid). */
-static void calc_grid(int n, int *cols, int *rows)
+static int fill_grid(int count, int cols, int gap_px,
+                     MixingLayoutRect *out, int cap)
 {
-    int c, best_c = 1, best_r = 1;
-    float best_diff = 1e9f;
+    double gx, gy;
+    int rows, i, n;
 
-    if (n <= 1) {
-        *cols = 1;
-        *rows = 1;
-        return;
-    }
-    for (c = 1; c <= n; c++) {
-        int r = (n + c - 1) / c;
-        float ratio = (float)c / (float)r;
-        float diff = fabsf(ratio - 16.f / 9.f);
-        if (diff < best_diff) {
-            best_diff = diff;
-            best_c = c;
-            best_r = r;
-        }
-    }
-    *cols = best_c;
-    *rows = best_r;
-}
-
-int ff_mixing_layout_equal(int n, int out_w, int out_h, MixingLayoutRect *out)
-{
-    int cols, rows, i;
-    int pad, gap, content_w, content_h, cell_w, cell_h;
-
-    if (!out || n < 1 || n > MIXING_LAYOUT_MAX)
+    if (!out || count < 1 || cols < 1 || cap < 1)
         return 0;
-
-    canvas_size(&out_w, &out_h);
-
-    pad = sx(LAY_PAD, out_w);
-    gap = sx(LAY_GAP, out_w);
-    /* keep vertical gap consistent with horizontal on non-16:9 canvases */
-    if (sy(LAY_GAP, out_h) != gap)
-        gap = FFMIN(gap, sy(LAY_GAP, out_h));
-
-    content_w = out_w - 2 * pad;
-    content_h = out_h - 2 * pad;
-    if (content_w < 2 || content_h < 2)
-        return 0;
-
-    calc_grid(n, &cols, &rows);
-    cell_w = (content_w - (cols - 1) * gap) / cols;
-    cell_h = (content_h - (rows - 1) * gap) / rows;
-    if (cell_w < 2 || cell_h < 2)
-        return 0;
-
+    n = FFMIN(count, cap);
+    rows = (n + cols - 1) / cols;
+    gap_pct(gap_px, &gx, &gy);
     for (i = 0; i < n; i++) {
         int c = i % cols;
         int r = i / cols;
-        int x = pad + c * (cell_w + gap);
-        int y = pad + r * (cell_h + gap);
-        out[i] = rect_px(x, y, cell_w, cell_h, out_w, out_h);
+        out[i] = box((c * 100.0) / cols, (r * 100.0) / rows,
+                     100.0 / cols, 100.0 / rows, gx, gy);
     }
     return n;
 }
 
-/* Max side thumbs (1 main + 3 side); more → bottom filmstrip. */
-#define SPEAKER_SIDE_MAX_THUMBS 3
-
-/*
- * Side strip: main 1432x806 + gap 16 + up to 3 thumbs at fixed 468x256
- * (aspect preserved). Column top-aligned with main; 3 thumbs ≈ bottom-align
- * (3*256+2*16=800 vs main 806).
- */
-static int speaker_side(int n_alive, int out_w, int out_h, MixingLayoutRect *out)
+const char *ff_mixing_layout_canon(const char *name)
 {
-    int n_thumbs = n_alive - 1;
-    int main_w = sx(REF_MAIN_W, out_w);
-    int main_h = sy(REF_MAIN_H, out_h);
-    int thumb_w = sx(REF_THUMB_W, out_w);
-    int thumb_h = sy(REF_THUMB_H, out_h);
-    int gap_x = sx(REF_GAP, out_w);
-    int gap_y = sy(REF_GAP, out_h);
-    int block_w, ox, oy, stack_h, ty, i;
-
-    if (n_thumbs > SPEAKER_SIDE_MAX_THUMBS)
-        n_thumbs = SPEAKER_SIDE_MAX_THUMBS;
-
-    if (main_w + gap_x + thumb_w > out_w) {
-        int over = main_w + gap_x + thumb_w - out_w;
-        main_w = FFMAX(2, main_w - over);
-    }
-    if (main_h > out_h)
-        main_h = out_h;
-
-    stack_h = n_thumbs > 0
-              ? n_thumbs * thumb_h + (n_thumbs - 1) * gap_y
-              : 0;
-    /* Keep main tall enough to cover the side stack (top/bottom align). */
-    if (stack_h > main_h)
-        main_h = FFMIN(out_h, stack_h);
-
-    block_w = main_w + gap_x + thumb_w;
-    ox = (out_w - block_w) / 2;
-    oy = (out_h - main_h) / 2;
-    if (ox < 0) ox = 0;
-    if (oy < 0) oy = 0;
-
-    out[0] = rect_px(ox, oy, main_w, main_h, out_w, out_h);
-
-    if (n_thumbs <= 0)
-        return 1;
-
-    /* Top-align with main; with 3 thumbs stack≈main → bottom nearly flush. */
-    ty = oy;
-    for (i = 0; i < n_thumbs; i++) {
-        out[i + 1] = rect_px(ox + main_w + gap_x, ty, thumb_w, thumb_h,
-                             out_w, out_h);
-        ty += thumb_h + gap_y;
-    }
-    return 1 + n_thumbs;
+    if (!name || !*name)
+        return NULL;
+    while (*name == ' ' || *name == '\t')
+        name++;
+    if (!av_strcasecmp(name, "single") || !strcmp(name, "1"))
+        return "single";
+    if (!av_strcasecmp(name, "split2") || !strcmp(name, "2") ||
+        !av_strcasecmp(name, "hsplit"))
+        return "split2";
+    if (!av_strcasecmp(name, "split2h") || !av_strcasecmp(name, "vsplit") ||
+        !av_strcasecmp(name, "triple"))
+        return "split2h";
+    if (!av_strcasecmp(name, "pip"))
+        return "pip";
+    if (!av_strcasecmp(name, "pip_tl"))
+        return "pip_tl";
+    if (!av_strcasecmp(name, "speaker") || !av_strcasecmp(name, "2v1"))
+        return "speaker";
+    if (!av_strcasecmp(name, "left3"))
+        return "left3";
+    if (!av_strcasecmp(name, "grid3"))
+        return "grid3";
+    if (!av_strcasecmp(name, "grid4") || !strcmp(name, "4") ||
+        !av_strcasecmp(name, "grid") || !av_strcasecmp(name, "quad"))
+        return "grid4";
+    if (!av_strcasecmp(name, "grid6"))
+        return "grid6";
+    if (!av_strcasecmp(name, "grid9") || !strcmp(name, "9"))
+        return "grid9";
+    if (!av_strcasecmp(name, "grid16"))
+        return "grid16";
+    if (!av_strcasecmp(name, "grid4col"))
+        return "grid4col";
+    return NULL;
 }
 
-/*
- * Bottom filmstrip: main on top; thumbs keep 468:256 aspect (uniform scale
- * down if the row would exceed canvas width). gap 16.
- */
-static int speaker_bottom(int n_alive, int out_w, int out_h, MixingLayoutRect *out)
+/* Speaker: main 1432x806 @1080p, three 16:9 thumbs sharing that height, gap 8. */
+static int layout_speaker(MixingLayoutRect *out, int cap)
 {
-    int n_thumbs = n_alive - 1;
-    int main_w = sx(REF_MAIN_W, out_w);
-    int main_h = sy(REF_MAIN_H, out_h);
-    int thumb_w = sx(REF_THUMB_W, out_w);
-    int thumb_h = sy(REF_THUMB_H, out_h);
-    int gap_x = sx(REF_GAP, out_w);
-    int gap_y = sy(REF_GAP, out_h);
-    int block_h, row_w, ox, oy, tx, i;
+    const double gpx = 8.0;
+    double main_w, main_h, gap_x, gap_y, thumb_h, thumb_w;
+    double block_w, ox, oy, side_x;
 
-    if (n_thumbs <= 0) {
-        ox = (out_w - main_w) / 2;
-        oy = (out_h - main_h) / 2;
-        if (ox < 0) ox = 0;
-        if (oy < 0) oy = 0;
-        out[0] = rect_px(ox, oy, main_w, main_h, out_w, out_h);
-        return 1;
-    }
-
-    row_w = n_thumbs * thumb_w + (n_thumbs - 1) * gap_x;
-    if (row_w > out_w) {
-        /* Uniform scale to fit width; preserve 468:256. */
-        int avail = out_w - (n_thumbs - 1) * gap_x;
-        thumb_w = FFMAX(2, avail / n_thumbs);
-        thumb_h = FFMAX(2, thumb_w * REF_THUMB_H / REF_THUMB_W);
-        row_w = n_thumbs * thumb_w + (n_thumbs - 1) * gap_x;
-    }
-
-    main_w = FFMAX(main_w, row_w);
-    if (main_w > out_w)
-        main_w = out_w;
-
-    block_h = main_h + gap_y + thumb_h;
-    if (block_h > out_h) {
-        int over = block_h - out_h;
-        main_h = FFMAX(2, main_h - over);
-        block_h = main_h + gap_y + thumb_h;
-        if (block_h > out_h) {
-            thumb_h = FFMAX(2, out_h - main_h - gap_y);
-            thumb_w = FFMAX(2, thumb_h * REF_THUMB_W / REF_THUMB_H);
-            row_w = n_thumbs * thumb_w + (n_thumbs - 1) * gap_x;
-            if (row_w > out_w) {
-                int avail = out_w - (n_thumbs - 1) * gap_x;
-                thumb_w = FFMAX(2, avail / n_thumbs);
-                thumb_h = FFMAX(2, thumb_w * REF_THUMB_H / REF_THUMB_W);
-                row_w = n_thumbs * thumb_w + (n_thumbs - 1) * gap_x;
-            }
-            block_h = main_h + gap_y + thumb_h;
-        }
-    }
-
-    ox = (out_w - main_w) / 2;
-    oy = (out_h - block_h) / 2;
-    if (ox < 0) ox = 0;
-    if (oy < 0) oy = 0;
-
-    out[0] = rect_px(ox, oy, main_w, main_h, out_w, out_h);
-
-    tx = ox + (main_w - row_w) / 2;
-    for (i = 0; i < n_thumbs; i++) {
-        out[i + 1] = rect_px(tx, oy + main_h + gap_y, thumb_w, thumb_h,
-                             out_w, out_h);
-        tx += thumb_w + gap_x;
-    }
-    return n_alive;
-}
-
-int ff_mixing_layout_speaker(int n_alive, int style, int out_w, int out_h,
-                             MixingLayoutRect *out)
-{
-    int use_bottom;
-
-    if (!out || n_alive < 1 || n_alive > MIXING_LAYOUT_MAX)
+    if (!out || cap < 4)
         return 0;
+    main_w = 1432.0 / REF_W * 100.0;
+    main_h = 806.0 / REF_H * 100.0;
+    gap_x = gpx / REF_W * 100.0;
+    gap_y = gpx / REF_H * 100.0;
+    thumb_h = fmax(0.5, (main_h - 2.0 * gap_y) / 3.0);
+    thumb_w = thumb_h;
+    block_w = main_w + gap_x + thumb_w;
+    ox = (100.0 - block_w) / 2.0;
+    oy = (100.0 - main_h) / 2.0;
+    side_x = ox + main_w + gap_x;
+    out[0].x = (float)ox;
+    out[0].y = (float)oy;
+    out[0].w = (float)main_w;
+    out[0].h = (float)main_h;
+    out[1].x = (float)side_x;
+    out[1].y = (float)oy;
+    out[1].w = (float)thumb_w;
+    out[1].h = (float)thumb_h;
+    out[2].x = (float)side_x;
+    out[2].y = (float)(oy + thumb_h + gap_y);
+    out[2].w = (float)thumb_w;
+    out[2].h = (float)thumb_h;
+    out[3].x = (float)side_x;
+    out[3].y = (float)(oy + 2.0 * (thumb_h + gap_y));
+    out[3].w = (float)thumb_w;
+    out[3].h = (float)thumb_h;
+    return 4;
+}
 
-    canvas_size(&out_w, &out_h);
+static int layout_pip(MixingLayoutRect *out, int cap, int top_left)
+{
+    double gx, gy;
 
-    if (n_alive == 1) {
-        int main_w = sx(REF_MAIN_W, out_w);
-        int main_h = sy(REF_MAIN_H, out_h);
-        int ox = (out_w - main_w) / 2;
-        int oy = (out_h - main_h) / 2;
-        if (ox < 0) ox = 0;
-        if (oy < 0) oy = 0;
-        out[0] = rect_px(ox, oy, main_w, main_h, out_w, out_h);
+    if (!out || cap < 2)
+        return 0;
+    gap_pct(12, &gx, &gy);
+    out[0].x = 0.f;
+    out[0].y = 0.f;
+    out[0].w = 100.f;
+    out[0].h = 100.f;
+    if (top_left)
+        out[1] = box(2.0, 2.0, 28.0, 28.0, gx, gy);
+    else
+        out[1] = box(70.0, 68.0, 28.0, 28.0, gx, gy);
+    return 2;
+}
+
+int ff_mixing_layout_by_name(const char *name, MixingLayoutRect *out, int cap)
+{
+    const char *id = ff_mixing_layout_canon(name);
+    double gx, gy;
+
+    if (!id || !out || cap < 1)
+        return 0;
+    if (!strcmp(id, "single")) {
+        out[0].x = 0.f;
+        out[0].y = 0.f;
+        out[0].w = 100.f;
+        out[0].h = 100.f;
         return 1;
     }
+    if (!strcmp(id, "split2"))
+        return fill_grid(2, 2, 16, out, cap);
+    if (!strcmp(id, "split2h"))
+        return fill_grid(2, 1, 16, out, cap);
+    if (!strcmp(id, "pip"))
+        return layout_pip(out, cap, 0);
+    if (!strcmp(id, "pip_tl"))
+        return layout_pip(out, cap, 1);
+    if (!strcmp(id, "speaker"))
+        return layout_speaker(out, cap);
+    if (!strcmp(id, "left3")) {
+        if (cap < 4)
+            return 0;
+        gap_pct(12, &gx, &gy);
+        out[0] = box(0.0, 0.0, 70.0, 100.0, gx, gy);
+        out[1] = box(70.0, 0.0, 30.0, 33.33, gx, gy);
+        out[2] = box(70.0, 33.33, 30.0, 33.33, gx, gy);
+        out[3] = box(70.0, 66.66, 30.0, 33.34, gx, gy);
+        return 4;
+    }
+    if (!strcmp(id, "grid3")) {
+        if (cap < 3)
+            return 0;
+        gap_pct(14, &gx, &gy);
+        out[0] = box(0.0, 0.0, 100.0, 58.0, gx, gy);
+        out[1] = box(0.0, 58.0, 50.0, 42.0, gx, gy);
+        out[2] = box(50.0, 58.0, 50.0, 42.0, gx, gy);
+        return 3;
+    }
+    if (!strcmp(id, "grid4"))
+        return fill_grid(4, 2, 16, out, cap);
+    if (!strcmp(id, "grid6"))
+        return fill_grid(6, 3, 12, out, cap);
+    if (!strcmp(id, "grid9"))
+        return fill_grid(9, 3, 10, out, cap);
+    if (!strcmp(id, "grid16"))
+        return fill_grid(16, 4, 8, out, cap);
+    if (!strcmp(id, "grid4col"))
+        return 0;
+    return 0;
+}
 
-    /* obs: side only with ≤3 thumbs (n≤4); more → bottom. grid: always bottom. */
-    use_bottom = (style != 0) || (n_alive > 1 + SPEAKER_SIDE_MAX_THUMBS);
-    if (use_bottom)
-        return speaker_bottom(n_alive, out_w, out_h, out);
-    return speaker_side(n_alive, out_w, out_h, out);
+const char *ff_mixing_layout_ceil_name(int n)
+{
+    if (n <= 1)
+        return "single";
+    if (n == 2)
+        return "split2";
+    if (n == 3)
+        return "grid3";
+    if (n == 4)
+        return "grid4";
+    if (n <= 6)
+        return "grid6";
+    if (n <= 9)
+        return "grid9";
+    if (n <= 16)
+        return "grid16";
+    return "grid4col";
+}
+
+int ff_mixing_layout_for_count(int n, MixingLayoutRect *out, int cap)
+{
+    const char *id;
+    int nr;
+
+    if (!out || cap < 1)
+        return 0;
+    if (n < 1)
+        n = 1;
+    if (n > MIXING_LAYOUT_MAX)
+        n = MIXING_LAYOUT_MAX;
+    id = ff_mixing_layout_ceil_name(n);
+    if (!strcmp(id, "grid4col"))
+        return fill_grid(n, 4, 8, out, cap);
+    nr = ff_mixing_layout_by_name(id, out, cap);
+    return nr;
 }

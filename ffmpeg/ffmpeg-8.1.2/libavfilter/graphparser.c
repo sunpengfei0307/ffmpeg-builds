@@ -20,6 +20,7 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include <limits.h>
 #include <string.h>
 #include <stdio.h>
 
@@ -33,6 +34,8 @@
 #include "filters.h"
 
 #define WHITESPACES " \n\t\r"
+/* Compact pad range [v0-v15] / [v0-15]; keep below mixing/dynamic_input hard cap. */
+#define LABEL_RANGE_MAX 64
 
 /**
  * Parse the name of a link, which has the format "[linkname]".
@@ -236,6 +239,130 @@ static void pad_params_free(AVFilterPadParams **pfpp)
     av_freep(pfpp);
 }
 
+static int parse_uint_span(const char *s, const char *end, int *out)
+{
+    int v = 0;
+
+    if (!s || s >= end || *s < '0' || *s > '9')
+        return 0;
+    while (s < end) {
+        int d;
+        if (*s < '0' || *s > '9')
+            return 0;
+        d = *s - '0';
+        if (v > (INT_MAX - d) / 10)
+            return 0;
+        v = v * 10 + d;
+        s++;
+    }
+    *out = v;
+    return 1;
+}
+
+/**
+ * Detect compact pad range "v0-v15" or "v0-15".
+ * Returns 1 if label is a range (prefix/start/end filled), 0 to keep it literal.
+ */
+static int parse_label_range(const char *label, char *prefix, size_t prefix_sz,
+                             int *start, int *end)
+{
+    const char *dash, *ldigits, *r;
+    size_t prefix_len;
+
+    if (!label || !prefix || prefix_sz < 1)
+        return 0;
+
+    dash = strrchr(label, '-');
+    if (!dash || dash == label || !dash[1])
+        return 0;
+    if (dash[-1] < '0' || dash[-1] > '9')
+        return 0;
+
+    ldigits = dash;
+    while (ldigits > label && ldigits[-1] >= '0' && ldigits[-1] <= '9')
+        ldigits--;
+
+    prefix_len = (size_t)(ldigits - label);
+    if (prefix_len >= prefix_sz)
+        return 0;
+    if (!parse_uint_span(ldigits, dash, start))
+        return 0;
+
+    r = dash + 1;
+    if (*r >= '0' && *r <= '9') {
+        /* "v0-15" */
+        if (!parse_uint_span(r, r + strlen(r), end))
+            return 0;
+    } else {
+        /* "v0-v15": right side must repeat the same prefix */
+        if (prefix_len == 0 || strncmp(r, label, prefix_len) != 0)
+            return 0;
+        r += prefix_len;
+        if (!parse_uint_span(r, r + strlen(r), end))
+            return 0;
+    }
+
+    memcpy(prefix, label, prefix_len);
+    prefix[prefix_len] = 0;
+    return 1;
+}
+
+static int pad_params_add(AVFilterPadParams ***pp, int *nb, char *label)
+{
+    AVFilterPadParams *par = av_mallocz(sizeof(*par));
+    int ret;
+
+    if (!par) {
+        av_freep(&label);
+        return AVERROR(ENOMEM);
+    }
+    par->label = label;
+    ret = av_dynarray_add_nofree(pp, nb, par);
+    if (ret < 0)
+        pad_params_free(&par);
+    return ret;
+}
+
+static int linklabel_add(void *logctx, AVFilterPadParams ***pp, int *nb,
+                         char *label)
+{
+    char prefix[128];
+    int start, end, i, ret;
+
+    if (!parse_label_range(label, prefix, sizeof(prefix), &start, &end))
+        return pad_params_add(pp, nb, label);
+
+    if (end < start) {
+        av_log(logctx, AV_LOG_ERROR,
+               "Invalid filtergraph pad label range \"%s\": end < start\n",
+               label);
+        av_freep(&label);
+        return AVERROR(EINVAL);
+    }
+    if (end - start + 1 > LABEL_RANGE_MAX) {
+        av_log(logctx, AV_LOG_ERROR,
+               "Filtergraph pad label range \"%s\" expands to more than %d labels\n",
+               label, LABEL_RANGE_MAX);
+        av_freep(&label);
+        return AVERROR(EINVAL);
+    }
+
+    av_freep(&label);
+    for (i = start; i <= end; i++) {
+        char buf[160];
+        char *name;
+
+        snprintf(buf, sizeof(buf), "%s%d", prefix, i);
+        name = av_strdup(buf);
+        if (!name)
+            return AVERROR(ENOMEM);
+        ret = pad_params_add(pp, nb, name);
+        if (ret < 0)
+            return ret;
+    }
+    return 0;
+}
+
 static void filter_params_free(AVFilterParams **pp)
 {
     AVFilterParams *p = *pp;
@@ -298,7 +425,6 @@ static int linklabels_parse(void *logctx, const char **linklabels,
 
     while (**linklabels == '[') {
         char *label;
-        AVFilterPadParams *par;
 
         label = parse_link_name(linklabels, logctx);
         if (!label) {
@@ -306,20 +432,9 @@ static int linklabels_parse(void *logctx, const char **linklabels,
             goto fail;
         }
 
-        par = av_mallocz(sizeof(*par));
-        if (!par) {
-            av_freep(&label);
-            ret = AVERROR(ENOMEM);
+        ret = linklabel_add(logctx, &pp, &nb, label);
+        if (ret < 0)
             goto fail;
-        }
-
-        par->label = label;
-
-        ret = av_dynarray_add_nofree(&pp, &nb, par);
-        if (ret < 0) {
-            pad_params_free(&par);
-            goto fail;
-        }
 
         *linklabels += strspn(*linklabels, WHITESPACES);
     }

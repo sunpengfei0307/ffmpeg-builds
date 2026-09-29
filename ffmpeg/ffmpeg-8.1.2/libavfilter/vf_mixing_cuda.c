@@ -71,12 +71,6 @@ enum InterpMode {
 enum LayoutMode {
     LAYOUT_ADAPTIVE = 0,
     LAYOUT_FIXED,
-    LAYOUT_SPEAKER,
-};
-
-enum SpeakerLayout {
-    SPK_OBS = 0,
-    SPK_GRID,
 };
 
 enum TransEffect {
@@ -132,6 +126,7 @@ typedef struct MixingCUDAContext {
     char *layout_str;
     char *layout_file;
     char *layout_cache;          /* last successfully applied JSON (owned) */
+    char layout_name[32];        /* preset id, or "custom" for free JSON */
     int64_t layout_mtime;
     uint8_t fill_rgba[4];
     uint16_t fill_y, fill_u, fill_v;
@@ -175,8 +170,7 @@ typedef struct MixingCUDAContext {
     /* ---- extensions: dynamic activation / speaker / zmq / CUevent ---- */
     int input_active[MIXING_CUDA_MAX_INPUTS];   /* logical active flags (set_active) */
     int primary_input;                           /* index driving output PTS (default 0) */
-    int layout_mode;                             /* adaptive / fixed / speaker */
-    int speaker_layout;                          /* obs / grid */
+    int layout_mode;                             /* adaptive / fixed */
     char *rank_endpoint;                         /* zmq SUB endpoint; overridden by task_id */
     int  task_id;                                /* prefer ipc:///data/LCMS/sock/gain_<id>.sock */
     int  speaker_hold_ms;                         /* candidate hold time before switch */
@@ -419,31 +413,25 @@ static int json_read_string_after(const char *p, const char *key, char *buf, int
     return 0;
 }
 
-/*
- * Default equal gallery over BUSINESS pads only. bg_input is the full-frame
- * plate and must never become a tile.
- */
-static void apply_default_grid(MixingCUDAContext *s, int n)
+/* Bind business pads (skip bg) onto the first rects. Extra inputs are dropped. */
+static int bind_business_rects(MixingCUDAContext *s, const MixingLayoutRect *rects, int nr)
 {
-    MixingLayoutRect rects[MIXING_LAYOUT_MAX];
     int business[MIXING_CUDA_MAX_INPUTS];
-    int nb_business = 0, i, use, nr;
+    int nb_business = 0, i, use;
 
+    if (!rects || nr <= 0)
+        return 0;
     for (i = 0; i < s->nb_inputs && nb_business < MIXING_CUDA_MAX_INPUTS; i++) {
         if (i == s->bg_input)
             continue;
         business[nb_business++] = i;
     }
     if (nb_business == 0)
-        return;
+        return 0;
 
-    use = FFMIN(FFMIN(n, nb_business), MIXING_LAYOUT_MAX);
-    nr = ff_mixing_layout_equal(use, s->out_w, s->out_h, rects);
-    if (nr <= 0)
-        return;
-
+    use = FFMIN(nr, nb_business);
     s->nb_slots = 0;
-    for (i = 0; i < nr; i++) {
+    for (i = 0; i < use; i++) {
         MixingSlot *sl = &s->slots[s->nb_slots++];
         memset(sl, 0, sizeof(*sl));
         mixing_slot_style_defaults(sl);
@@ -456,6 +444,24 @@ static void apply_default_grid(MixingCUDAContext *s, int n)
         sl->visible = 1;
         sl->stalled = 0;
     }
+    return use;
+}
+
+/*
+ * Ceiling preset over BUSINESS pads. bg_input stays the full-frame plate.
+ * n is the input count used to pick the preset (round up). Only existing
+ * pads are bound, so a 5-input grid6 leaves the 6th cell empty.
+ */
+static void apply_default_grid(MixingCUDAContext *s, int n)
+{
+    MixingLayoutRect rects[MIXING_LAYOUT_MAX];
+    const char *id = ff_mixing_layout_ceil_name(n);
+    int nr = ff_mixing_layout_for_count(n, rects, MIXING_LAYOUT_MAX);
+
+    if (nr <= 0)
+        return;
+    av_strlcpy(s->layout_name, id, sizeof(s->layout_name));
+    bind_business_rects(s, rects, nr);
 }
 
 /* Fixed-layout JSON must place at least one business pad with positive size. */
@@ -490,28 +496,57 @@ static void apply_default_layout_fallback(AVFilterContext *ctx, const char *reas
     s->nb_layout_slots = s->nb_slots;
     s->collapse_active = 0;
     av_log(ctx, AV_LOG_WARNING,
-           "mixing_cuda: layout invalid (%s) ...using default %d-slot business grid "
-           "(skip bg_input=%d)\n",
-           reason ? reason : "unknown", s->nb_slots, s->bg_input);
+           "mixing_cuda: layout invalid (%s) ...using preset %s (%d slots, skip bg_input=%d)\n",
+           reason ? reason : "unknown",
+           s->layout_name[0] ? s->layout_name : "single",
+           s->nb_slots, s->bg_input);
 }
 
 /*
- * apply_active_grid: adaptive equal gallery (1..MIXING_LAYOUT_MAX).
- * Only active inputs are placed; inactive ones skipped (fill rendered).
+ * apply_active_grid: ceiling 16:9 preset for the live count.
+ * 5 live inputs occupy the first 5 cells of grid6; the extra cell stays empty.
+ * speaker_switch=1 puts the current speaker in the first cell.
  */
 static void apply_active_grid(MixingCUDAContext *s, const int *alive, int n_alive)
 {
     MixingLayoutRect rects[MIXING_LAYOUT_MAX];
+    int order[MIXING_CUDA_MAX_INPUTS];
     int n = FFMIN(FFMAX(n_alive, 1), MIXING_LAYOUT_MAX);
-    int nr, i;
+    int nr, i, k, have_sp = 0;
 
-    nr = ff_mixing_layout_equal(n, s->out_w, s->out_h, rects);
+    if (n_alive <= 0) {
+        s->nb_slots = 0;
+        return;
+    }
+
+    if (s->speaker_switch && s->active_speaker >= 0 &&
+        s->active_speaker != s->bg_input) {
+        for (i = 0; i < n_alive; i++) {
+            if (alive[i] == s->active_speaker) {
+                have_sp = 1;
+                break;
+            }
+        }
+    }
+    if (have_sp) {
+        k = 0;
+        order[k++] = s->active_speaker;
+        for (i = 0; i < n_alive && k < MIXING_CUDA_MAX_INPUTS; i++) {
+            if (alive[i] != s->active_speaker)
+                order[k++] = alive[i];
+        }
+    } else {
+        memcpy(order, alive, n_alive * sizeof(*order));
+    }
+
+    /* Ceiling preset: 5 live inputs use grid6's first 5 cells, 6th stays empty. */
+    nr = ff_mixing_layout_for_count(n, rects, MIXING_LAYOUT_MAX);
     s->nb_slots = 0;
     for (i = 0; i < nr && i < n_alive; i++) {
         MixingSlot *sl = &s->slots[s->nb_slots++];
         memset(sl, 0, sizeof(*sl));
         mixing_slot_style_defaults(sl);
-        sl->input = alive[i];
+        sl->input = order[i];
         sl->x = rects[i].x;
         sl->y = rects[i].y;
         sl->w = rects[i].w;
@@ -519,68 +554,6 @@ static void apply_active_grid(MixingCUDAContext *s, const int *alive, int n_aliv
         sl->z = i;
         sl->visible = 1;
         sl->stalled = 0;
-    }
-}
-
-/*
- * build_speaker_layout: spotlight set (separate from equal gallery).
- * rects[0]=main; remaining=thumbs. Map speaker ->main, others in alive order.
- */
-static void build_speaker_layout(MixingCUDAContext *s, int speaker,
-                                  const int *alive, int n_alive)
-{
-    MixingLayoutRect rects[MIXING_LAYOUT_MAX];
-    int n = FFMIN(n_alive, MIXING_LAYOUT_MAX);
-    int i, ti, speaker_alive = 0, nr, style;
-
-    s->nb_slots = 0;
-    if (n == 0)
-        return;
-
-    for (i = 0; i < n; i++) {
-        if (alive[i] == speaker) {
-            speaker_alive = 1;
-            break;
-        }
-    }
-    if (!speaker_alive)
-        speaker = alive[0];
-
-    style = (s->speaker_layout == SPK_OBS) ? 0 : 1;
-    nr = ff_mixing_layout_speaker(n, style, s->out_w, s->out_h, rects);
-    if (nr <= 0)
-        return;
-
-    {
-        MixingSlot *sp = &s->slots[s->nb_slots++];
-        memset(sp, 0, sizeof(*sp));
-        mixing_slot_style_defaults(sp);
-        sp->input = speaker;
-        sp->x = rects[0].x;
-        sp->y = rects[0].y;
-        sp->w = rects[0].w;
-        sp->h = rects[0].h;
-        sp->z = 0;
-        sp->visible = 1;
-        sp->stalled = 0;
-    }
-    ti = 1;
-    for (i = 0; i < n && ti < nr; i++) {
-        MixingSlot *sp;
-        if (alive[i] == speaker)
-            continue;
-        sp = &s->slots[s->nb_slots++];
-        memset(sp, 0, sizeof(*sp));
-        mixing_slot_style_defaults(sp);
-        sp->input = alive[i];
-        sp->x = rects[ti].x;
-        sp->y = rects[ti].y;
-        sp->w = rects[ti].w;
-        sp->h = rects[ti].h;
-        sp->z = ti;
-        sp->visible = 1;
-        sp->stalled = 0;
-        ti++;
     }
 }
 
@@ -816,12 +789,23 @@ static int parse_layout_json(MixingCUDAContext *s, const char *json, void *log)
     if (!layout_slots_valid(s)) {
         av_log(log, AV_LOG_WARNING,
                "mixing_cuda: parsed layout has no usable business slots "
-               "(need input鈮燽g_input with w/h>0)\n");
+               "(need input!=bg_input with w/h>0)\n");
         return AVERROR(EINVAL);
     }
 
-    av_log(log, AV_LOG_INFO, "mixing_cuda: parsed %d slots, canvas %dx%d, on_disconnect=%s\n",
+    {
+        char idbuf[32];
+        if (json_read_string_after(json, "layout", idbuf, sizeof(idbuf)) == 0) {
+            const char *id = ff_mixing_layout_canon(idbuf);
+            av_strlcpy(s->layout_name, id ? id : "custom", sizeof(s->layout_name));
+        } else {
+            av_strlcpy(s->layout_name, "custom", sizeof(s->layout_name));
+        }
+    }
+
+    av_log(log, AV_LOG_INFO, "mixing_cuda: parsed %d slots, canvas %dx%d, layout=%s, on_disconnect=%s\n",
            s->nb_slots, s->out_w, s->out_h,
+           s->layout_name[0] ? s->layout_name : "custom",
            s->on_disconnect == ON_DISC_COLLAPSE ? "collapse" : "fill");
     return 0;
 }
@@ -928,116 +912,223 @@ static int mixing_cuda_apply_layout_json(AVFilterContext *ctx, const char *json,
     return 0;
 }
 
-/*
- * adapt + template: N=min(alive,M); alive>M discard extras; alive<M shrink to N
- * largest cells. speaker_switch=1 ->main speaker in largest/frontmost cell.
- */
-static void apply_adapt_from_template(AVFilterContext *ctx, MixingCUDAContext *s,
-                                      const int *alive, int n_alive)
+/* Decimal with a dot, independent of the process locale. */
+static int append_num(char *buf, int cap, int *off, float v)
 {
-    int order[MIXING_CUDA_MAX_INPUTS];
-    int cell[MIXING_CUDA_MAX_INPUTS];
-    int pads[MIXING_CUDA_MAX_INPUTS];
-    int M = s->nb_layout_slots;
-    int N, i, j, main_i, sp, have_sp;
-
-    s->nb_slots = 0;
-    if (M <= 0 || n_alive <= 0)
-        return;
-
-    N = FFMIN(n_alive, M);
-
-    for (i = 0; i < M; i++)
-        order[i] = i;
-    /* area desc, then smaller z, then lower index */
-    for (i = 0; i < M; i++) {
-        for (j = i + 1; j < M; j++) {
-            MixingSlot *a = &s->layout_slots[order[i]];
-            MixingSlot *b = &s->layout_slots[order[j]];
-            float aa = a->w * a->h, bb = b->w * b->h;
-            int swap = 0;
-            if (bb > aa + 1e-6f)
-                swap = 1;
-            else if (bb >= aa - 1e-6f && bb <= aa + 1e-6f) {
-                if (b->z < a->z || (b->z == a->z && order[j] < order[i]))
-                    swap = 1;
-            }
-            if (swap)
-                FFSWAP(int, order[i], order[j]);
-        }
+    int neg = v < 0.f;
+    int ip, frac, n;
+    if (neg)
+        v = -v;
+    ip = (int)v;
+    frac = (int)((v - (float)ip) * 10000.f + 0.5f);
+    if (frac >= 10000) {
+        ip++;
+        frac -= 10000;
     }
+    if (frac < 0)
+        frac = 0;
+    if (*off >= cap)
+        return AVERROR(ERANGE);
+    n = snprintf(buf + *off, cap - *off, neg ? "-%d.%04d" : "%d.%04d", ip, frac);
+    if (n < 0 || *off + n >= cap)
+        return AVERROR(ERANGE);
+    *off += n;
+    return 0;
+}
 
-    if (n_alive < M) {
-        /* shrink: keep N largest cells; cell[0] is main */
-        for (i = 0; i < N; i++)
-            cell[i] = order[i];
-    } else {
-        /* full / discard: keep JSON order for stable positions */
-        for (i = 0; i < N; i++)
-            cell[i] = i;
-    }
+static int append_str(char *buf, int cap, int *off, const char *s)
+{
+    int n;
+    if (*off >= cap)
+        return AVERROR(ERANGE);
+    n = snprintf(buf + *off, cap - *off, "%s", s ? s : "");
+    if (n < 0 || *off + n >= cap)
+        return AVERROR(ERANGE);
+    *off += n;
+    return 0;
+}
 
-    for (i = 0; i < N; i++)
-        pads[i] = alive[i];
+/* Snapshot layout_slots into the on-disk JSON shape. Caller frees the buffer. */
+static char *mixing_cuda_slots_to_json(MixingCUDAContext *s)
+{
+    char *buf;
+    int cap = 16384, off = 0, i;
+    const char *name = s->layout_name[0] ? s->layout_name : "custom";
 
-    sp = s->active_speaker;
-    have_sp = 0;
-    if (s->speaker_switch && sp >= 0 && sp != s->bg_input) {
-        for (i = 0; i < n_alive; i++) {
-            if (alive[i] == sp) {
-                have_sp = 1;
-                break;
-            }
-        }
+    buf = av_malloc(cap);
+    if (!buf)
+        return NULL;
+    buf[0] = 0;
+    if (append_str(buf, cap, &off, "{\"layout\":\"") < 0 ||
+        append_str(buf, cap, &off, name) < 0 ||
+        append_str(buf, cap, &off, "\",\"canvas\":{\"w\":") < 0)
+        goto fail;
+    if (append_num(buf, cap, &off, (float)s->out_w) < 0 ||
+        append_str(buf, cap, &off, ",\"h\":") < 0 ||
+        append_num(buf, cap, &off, (float)s->out_h) < 0 ||
+        append_str(buf, cap, &off, "},\"on_disconnect\":\"") < 0 ||
+        append_str(buf, cap, &off,
+                   s->on_disconnect == ON_DISC_COLLAPSE ? "collapse" : "fill") < 0 ||
+        append_str(buf, cap, &off, "\",\"videos\":[") < 0)
+        goto fail;
+    for (i = 0; i < s->nb_layout_slots; i++) {
+        const MixingSlot *sl = &s->layout_slots[i];
+        if (i && append_str(buf, cap, &off, ",") < 0)
+            goto fail;
+        if (append_str(buf, cap, &off, "{\"input\":") < 0)
+            goto fail;
+        if (append_num(buf, cap, &off, (float)sl->input) < 0 ||
+            append_str(buf, cap, &off, ",\"x\":") < 0 ||
+            append_num(buf, cap, &off, sl->x) < 0 ||
+            append_str(buf, cap, &off, ",\"y\":") < 0 ||
+            append_num(buf, cap, &off, sl->y) < 0 ||
+            append_str(buf, cap, &off, ",\"w\":") < 0 ||
+            append_num(buf, cap, &off, sl->w) < 0 ||
+            append_str(buf, cap, &off, ",\"h\":") < 0 ||
+            append_num(buf, cap, &off, sl->h) < 0 ||
+            append_str(buf, cap, &off, ",\"z\":") < 0 ||
+            append_num(buf, cap, &off, (float)sl->z) < 0 ||
+            append_str(buf, cap, &off, ",\"visible\":") < 0 ||
+            append_num(buf, cap, &off, sl->visible ? 1.f : 0.f) < 0 ||
+            append_str(buf, cap, &off, "}") < 0)
+            goto fail;
     }
-    if (have_sp) {
-        int k = 0;
-        pads[k++] = sp;
-        for (i = 0; i < n_alive && k < N; i++) {
-            if (alive[i] != sp)
-                pads[k++] = alive[i];
-        }
-    }
+    if (append_str(buf, cap, &off, "]}") < 0)
+        goto fail;
+    return buf;
+fail:
+    av_free(buf);
+    return NULL;
+}
 
-    /* main cell index within cell[] */
-    main_i = 0;
-    if (n_alive >= M) {
-        float best = s->layout_slots[cell[0]].w * s->layout_slots[cell[0]].h;
-        for (i = 1; i < N; i++) {
-            float a = s->layout_slots[cell[i]].w * s->layout_slots[cell[i]].h;
-            MixingSlot *bi = &s->layout_slots[cell[i]];
-            MixingSlot *bm = &s->layout_slots[cell[main_i]];
-            if (a > best + 1e-6f ||
-                (a >= best - 1e-6f && (bi->z < bm->z ||
-                 (bi->z == bm->z && cell[i] < cell[main_i])))) {
-                best = a;
-                main_i = i;
-            }
-        }
-    }
+/* Runtime edits land in layout_file when one was configured. */
+static int mixing_cuda_sync_layout_file(AVFilterContext *ctx, const char *json)
+{
+    MixingCUDAContext *s = ctx->priv;
+    FILE *f;
+    size_t n, nw;
 
-    for (i = 0; i < N; i++) {
-        s->slots[i] = s->layout_slots[cell[i]];
-        s->slots[i].visible = 1;
-        s->slots[i].stalled = 0;
-    }
-    if (have_sp) {
-        int pi = 1;
-        s->slots[main_i].input = pads[0];
-        for (i = 0; i < N; i++) {
-            if (i == main_i)
-                continue;
-            s->slots[i].input = pads[pi++];
-        }
-    } else {
-        for (i = 0; i < N; i++)
-            s->slots[i].input = pads[i];
-    }
-    s->nb_slots = N;
-    if (n_alive > M)
+    if (!s->layout_file || !*s->layout_file || !json || !*json)
+        return 0;
+    f = fopen(s->layout_file, "wb");
+    if (!f) {
         av_log(ctx, AV_LOG_WARNING,
-               "mixing_cuda: adapt discard %d extra live pad(s) (template=%d)\n",
-               n_alive - M, M);
+               "mixing_cuda: cannot sync layout_file '%s'\n", s->layout_file);
+        return AVERROR(EIO);
+    }
+    n = strlen(json);
+    nw = fwrite(json, 1, n, f);
+    fclose(f);
+    if (nw != n) {
+        av_log(ctx, AV_LOG_WARNING,
+               "mixing_cuda: short write layout_file '%s'\n", s->layout_file);
+        return AVERROR(EIO);
+    }
+    s->layout_mtime = file_size_marker(s->layout_file);
+    av_log(ctx, AV_LOG_WARNING,
+           "mixing_cuda: layout synced -> %s (%zu bytes)\n", s->layout_file, n);
+    return 0;
+}
+
+static void mixing_cuda_copy_slots_to_layout(MixingCUDAContext *s)
+{
+    int j, nb = FFMIN(s->nb_slots, MIXING_CUDA_MAX_INPUTS);
+    for (j = 0; j < nb; j++)
+        s->layout_slots[j] = s->slots[j];
+    s->nb_layout_slots = nb;
+    s->collapse_active = 0;
+}
+
+static const char *mixing_cuda_layout_token(const char *in, char *buf, size_t buflen)
+{
+    size_t n = 0;
+    if (!in)
+        in = "";
+    while (*in == ' ' || *in == '\t')
+        in++;
+    while (in[n] && in[n] != ' ' && in[n] != '\t' &&
+           in[n] != '\r' && in[n] != '\n' && n + 1 < buflen) {
+        buf[n] = in[n];
+        n++;
+    }
+    buf[n] = 0;
+    return buf;
+}
+
+static int mixing_cuda_apply_preset(AVFilterContext *ctx, const char *name, int persist)
+{
+    MixingCUDAContext *s = ctx->priv;
+    MixingLayoutRect rects[MIXING_LAYOUT_MAX];
+    char tok[64];
+    const char *id;
+    char *json;
+    int nr, bound, nb_business = 0, j;
+
+    mixing_cuda_layout_token(name, tok, sizeof(tok));
+    id = ff_mixing_layout_canon(tok);
+    if (!id || !strcmp(id, "grid4col")) {
+        av_log(ctx, AV_LOG_ERROR,
+               "mixing_cuda: unknown layout '%s' "
+               "(single|split2|split2h|pip|pip_tl|speaker|left3|"
+               "grid3|grid4|grid6|grid9|grid16)\n",
+               tok[0] ? tok : "(empty)");
+        return AVERROR(EINVAL);
+    }
+    nr = ff_mixing_layout_by_name(id, rects, MIXING_LAYOUT_MAX);
+    if (nr <= 0)
+        return AVERROR(EINVAL);
+    av_strlcpy(s->layout_name, id, sizeof(s->layout_name));
+    bound = bind_business_rects(s, rects, nr);
+    if (bound <= 0) {
+        av_log(ctx, AV_LOG_ERROR,
+               "mixing_cuda: preset %s has no business input (bg_input=%d)\n",
+               id, s->bg_input);
+        return AVERROR(EINVAL);
+    }
+    for (j = 0; j < s->nb_inputs; j++)
+        if (j != s->bg_input)
+            nb_business++;
+    if (nb_business > nr)
+        av_log(ctx, AV_LOG_WARNING,
+               "mixing_cuda: preset %s has %d slots, %d business inputs; "
+               "extra inputs stay off-canvas\n",
+               id, nr, nb_business);
+    mixing_cuda_copy_slots_to_layout(s);
+    s->last_nb_active = -1;
+    s->last_speaker = -1;
+    if (persist) {
+        json = mixing_cuda_slots_to_json(s);
+        if (!json)
+            return AVERROR(ENOMEM);
+        av_freep(&s->layout_cache);
+        s->layout_cache = json;
+        mixing_cuda_persist_layout(ctx, json);
+        mixing_cuda_sync_layout_file(ctx, json);
+    }
+    av_log(ctx, AV_LOG_WARNING,
+           "mixing_cuda: preset %s applied (%d/%d cells)\n", id, bound, nr);
+    return 0;
+}
+
+/* layout= / zmq layout: '{' is JSON, anything else is a preset name. */
+static int mixing_cuda_apply_layout_arg(AVFilterContext *ctx, const char *spec,
+                                        int persist)
+{
+    MixingCUDAContext *s = ctx->priv;
+    const char *p = spec ? spec : "";
+    int ret;
+
+    while (*p == ' ' || *p == '\t')
+        p++;
+    if (!*p)
+        return AVERROR(EINVAL);
+    if (*p == '{') {
+        ret = mixing_cuda_apply_layout_json(ctx, p, persist);
+        if (ret >= 0 && persist)
+            mixing_cuda_sync_layout_file(ctx, s->layout_cache);
+        return ret;
+    }
+    return mixing_cuda_apply_preset(ctx, p, persist);
 }
 
 static int load_layout_file(AVFilterContext *ctx)
@@ -1331,7 +1422,7 @@ static void rebuild_active_slots(AVFilterContext *ctx, MixingCUDAContext *s, int
     int i, need_collapse = 0;
     int nb_active_logical = 0;
 
-    /* fixed needs JSON/default slots; speaker/adaptive build their own geometry. */
+    /* fixed needs JSON/default slots; adaptive builds geometry from live count. */
     if (s->layout_mode == LAYOUT_FIXED && s->nb_layout_slots == 0)
         return;
 
@@ -1344,7 +1435,7 @@ static void rebuild_active_slots(AVFilterContext *ctx, MixingCUDAContext *s, int
         if (!s->input_active[i])
             continue;
         nb_active_logical++;
-        /* Fixed layout blits as soon as active; adaptive/speaker wait join_stable. */
+        /* Fixed layout blits as soon as active; adaptive waits join_stable. */
         if (s->layout_mode == LAYOUT_FIXED ? input_is_active(s, i, now)
                                            : input_is_stable_alive(s, i, now)) {
             if (nb_alive < MIXING_CUDA_MAX_INPUTS)
@@ -1355,8 +1446,8 @@ static void rebuild_active_slots(AVFilterContext *ctx, MixingCUDAContext *s, int
     /* Keep FrameSync clock on bg plate; never promote a flaky business pad to clock. */
     apply_framesync_roles(s);
 
-    /* Incentive / active_speaker update (adapt + legacy speaker; also for fixed border). */
-    if (s->speaker_switch || s->layout_mode != LAYOUT_FIXED) {
+    /* Incentive / active_speaker (highlight + adaptive first cell). */
+    if (s->speaker_switch || s->layout_mode == LAYOUT_ADAPTIVE) {
         int cand = s->active_speaker;
         int speaker_alive = 0;
 #if CONFIG_LIBZMQ
@@ -1404,8 +1495,8 @@ static void rebuild_active_slots(AVFilterContext *ctx, MixingCUDAContext *s, int
         }
     }
 
-    /* ---- adapt (+ deprecated speaker): template fill / shrink / discard ---- */
-    if (s->layout_mode == LAYOUT_ADAPTIVE || s->layout_mode == LAYOUT_SPEAKER) {
+    /* adaptive: ceiling 16:9 preset by live count (extra cells stay empty). */
+    if (s->layout_mode == LAYOUT_ADAPTIVE) {
         int nb = FFMIN(nb_alive, MIXING_CUDA_MAX_INPUTS);
         if (nb == 0) {
             s->nb_slots = 0;
@@ -1414,14 +1505,7 @@ static void rebuild_active_slots(AVFilterContext *ctx, MixingCUDAContext *s, int
             return;
         }
         if (s->last_speaker != s->active_speaker || s->last_nb_active != nb_alive) {
-            if (s->nb_layout_slots > 0) {
-                apply_adapt_from_template(ctx, s, alive, nb);
-            } else if (s->layout_mode == LAYOUT_SPEAKER || s->speaker_switch) {
-                /* No JSON: legacy built-in speaker geometry. */
-                build_speaker_layout(s, s->active_speaker, alive, nb);
-            } else {
-                apply_active_grid(s, alive, nb);
-            }
+            apply_active_grid(s, alive, nb);
             s->last_speaker = s->active_speaker;
             s->last_nb_active = nb_alive;
         }
@@ -2028,27 +2112,25 @@ static av_cold int mixing_cuda_init(AVFilterContext *ctx)
 
     s->fs.on_event = mixing_cuda_compose;
 
-    if (s->layout_mode == LAYOUT_SPEAKER) {
-        av_log(ctx, AV_LOG_WARNING,
-               "mixing_cuda: layout_mode=speaker is deprecated ->adapt "
-               "(use speaker_switch for incentive; layout JSON for geometry)\n");
-        s->layout_mode = LAYOUT_ADAPTIVE;
-    }
-
-    /* fixed/adapt: load layout_str ->layout_file ->/data/LCMS/layouts/<task_id>.layout */
+    /* fixed: layout_file, else layout= preset/JSON, else task persist, else ceiling preset.
+     * adaptive keeps that geometry cached; the picture follows the live-count preset. */
     {
         int parsed = 0;
         char task_path[256];
 
-        if (s->layout_str && *s->layout_str) {
-            if (mixing_cuda_apply_layout_json(ctx, s->layout_str, 1) < 0)
-                apply_default_layout_fallback(ctx, "inline layout JSON invalid");
-            else
+        if (s->layout_file && *s->layout_file) {
+            if (load_layout_file(ctx) >= 0 && layout_slots_valid(s)) {
                 parsed = 1;
+                if (s->layout_str && *s->layout_str)
+                    av_log(ctx, AV_LOG_WARNING,
+                           "mixing_cuda: layout_file set, ignoring layout=%s\n",
+                           s->layout_str);
+            }
         }
-        if (!parsed && s->layout_file && *s->layout_file) {
-            if (load_layout_file(ctx) >= 0 && layout_slots_valid(s))
-                parsed = 1;
+        if (!parsed && s->layout_str && *s->layout_str) {
+            if (mixing_cuda_apply_layout_arg(ctx, s->layout_str, 1) < 0)
+                apply_default_layout_fallback(ctx, "layout= preset/JSON invalid");
+            parsed = 1;
         }
         if (!parsed &&
             mixing_cuda_task_layout_path(s, task_path, sizeof(task_path)) == 0) {
@@ -2063,7 +2145,7 @@ static av_cold int mixing_cuda_init(AVFilterContext *ctx)
             s->layout_file = saved;
         }
         if (s->layout_mode == LAYOUT_FIXED && !layout_slots_valid(s))
-            apply_default_layout_fallback(ctx, "no usable layout JSON");
+            apply_default_layout_fallback(ctx, "no usable layout");
     }
 
     return 0;
@@ -2326,7 +2408,6 @@ static const char *mixing_cuda_layout_mode_name(int mode)
 {
     switch (mode) {
     case LAYOUT_ADAPTIVE: return "adaptive";
-    case LAYOUT_SPEAKER:  return "speaker";
     default:              return "fixed";
     }
 }
@@ -2348,18 +2429,19 @@ static int mixing_cuda_apply_layout_mode(AVFilterContext *ctx, int mode)
     s->layout_mode = mode;
     s->last_nb_active = -1;
     s->last_speaker = -1;
-    if (mode == LAYOUT_FIXED || mode == LAYOUT_ADAPTIVE) {
-        if (s->layout_cache && *s->layout_cache) {
-            if (parse_layout_json(s, s->layout_cache, ctx) < 0 && mode == LAYOUT_FIXED)
-                apply_default_layout_fallback(ctx, "cached layout JSON invalid");
-        } else if (s->layout_file) {
+    if (mode == LAYOUT_FIXED) {
+        if (s->layout_file && *s->layout_file) {
             s->layout_mtime = 0;
             load_layout_file(ctx);
-        } else if (s->layout_str) {
-            if (mixing_cuda_apply_layout_json(ctx, s->layout_str, 0) < 0 &&
-                mode == LAYOUT_FIXED)
-                apply_default_layout_fallback(ctx, "layout_mode=fixed but layout JSON invalid");
-        } else if (mode == LAYOUT_FIXED && s->nb_layout_slots == 0) {
+            if (!layout_slots_valid(s))
+                apply_default_layout_fallback(ctx, "layout_file invalid on mode switch");
+        } else if (s->layout_cache && *s->layout_cache) {
+            if (parse_layout_json(s, s->layout_cache, ctx) < 0)
+                apply_default_layout_fallback(ctx, "cached layout JSON invalid");
+        } else if (s->layout_str && *s->layout_str) {
+            if (mixing_cuda_apply_layout_arg(ctx, s->layout_str, 0) < 0)
+                apply_default_layout_fallback(ctx, "layout= preset/JSON invalid");
+        } else if (s->nb_layout_slots == 0) {
             apply_default_layout_fallback(ctx, "layout_mode=fixed without layout/layout_file");
         }
     }
@@ -2551,23 +2633,21 @@ static int mixing_cuda_process_command(AVFilterContext *ctx, const char *cmd,
         return mixing_cuda_cmd_slot_style(ctx, args);
 
     if (!strcmp(cmd, "layout") && args) {
-        if (s->layout_mode != LAYOUT_FIXED && s->layout_mode != LAYOUT_ADAPTIVE &&
-            s->layout_mode != LAYOUT_SPEAKER) {
-            av_log(ctx, AV_LOG_ERROR,
-                   "mixing_cuda: 'layout' unsupported in mode=%s\n",
-                   mixing_cuda_layout_mode_name(s->layout_mode));
-            return AVERROR(EINVAL);
-        }
-        ret = mixing_cuda_apply_layout_json(ctx, args, 1);
+        ret = mixing_cuda_apply_layout_arg(ctx, args, 1);
         if (ret < 0) {
             av_log(ctx, AV_LOG_ERROR,
-                   "mixing_cuda: layout JSON invalid, applying fallback\n");
-            apply_default_layout_fallback(ctx, "layout command JSON invalid");
+                   "mixing_cuda: layout command invalid, applying fallback\n");
+            if (s->layout_mode == LAYOUT_FIXED)
+                apply_default_layout_fallback(ctx, "layout command invalid");
             return AVERROR(EINVAL);
         }
-        av_log(ctx, AV_LOG_WARNING,
-               "mixing_cuda: layout JSON applied (mode=%s) and persisted\n",
-               mixing_cuda_layout_mode_name(s->layout_mode));
+        s->last_nb_active = -1;
+        if (s->layout_mode == LAYOUT_ADAPTIVE)
+            av_log(ctx, AV_LOG_WARNING,
+                   "mixing_cuda: layout saved (adaptive still follows live count)\n");
+        else
+            av_log(ctx, AV_LOG_WARNING,
+                   "mixing_cuda: layout applied (mode=fixed) and synced\n");
         return 0;
     }
     if (!strcmp(cmd, "reload")) {
@@ -2599,11 +2679,7 @@ static int mixing_cuda_process_command(AVFilterContext *ctx, const char *cmd,
             mode = LAYOUT_FIXED;
         else if (!strcmp(args, "adaptive") || !strcmp(args, "adapt"))
             mode = LAYOUT_ADAPTIVE;
-        else if (!strcmp(args, "speaker")) {
-            av_log(ctx, AV_LOG_WARNING,
-                   "mixing_cuda: layout_mode=speaker deprecated ->adapt\n");
-            mode = LAYOUT_ADAPTIVE;
-        } else {
+        else {
             av_log(ctx, AV_LOG_ERROR,
                    "mixing_cuda: unsupported layout_mode='%s' "
                    "(need: fixed|adapt|adaptive)\n", args);
@@ -2661,13 +2737,6 @@ static int mixing_cuda_process_command(AVFilterContext *ctx, const char *cmd,
     }
     if (!strcmp(cmd, "active_speaker") && args) {
         int idx;
-        if (s->layout_mode != LAYOUT_SPEAKER) {
-            av_log(ctx, AV_LOG_ERROR,
-                   "mixing_cuda: active_speaker only in layout_mode=speaker "
-                   "(current=%s); try: mixing_cuda layout_mode speaker\n",
-                   mixing_cuda_layout_mode_name(s->layout_mode));
-            return AVERROR(EINVAL);
-        }
         if (sscanf(args, "%d", &idx) != 1 || idx < 0 || idx >= s->nb_inputs ||
             idx == s->bg_input) {
             av_log(ctx, AV_LOG_ERROR,
@@ -2683,19 +2752,6 @@ static int mixing_cuda_process_command(AVFilterContext *ctx, const char *cmd,
         av_log(ctx, AV_LOG_WARNING,
                "mixing_cuda: active_speaker=%d (speaker_switch=%d)\n",
                idx, s->speaker_switch);
-        return 0;
-    }
-    if (!strcmp(cmd, "speaker_layout") && args) {
-        if (!strcmp(args, "obs"))       s->speaker_layout = SPK_OBS;
-        else if (!strcmp(args, "grid"))  s->speaker_layout = SPK_GRID;
-        else {
-            av_log(ctx, AV_LOG_ERROR,
-                   "mixing_cuda: unsupported speaker_layout='%s' (obs|grid)\n",
-                   args);
-            return AVERROR(EINVAL);
-        }
-        s->last_speaker = -1;
-        av_log(ctx, AV_LOG_WARNING, "mixing_cuda: speaker_layout=%s\n", args);
         return 0;
     }
     if (!strcmp(cmd, "speaker_switch") && args) {
@@ -2755,36 +2811,34 @@ static const AVOption mixing_cuda_options[] = {
     { "interp", "scaling interpolation", OFFSET(interp), AV_OPT_TYPE_INT, {.i64 = INTERP_BILINEAR}, 0, 1, TFLAGS, .unit = "interp" },
         { "bilinear", "bilinear interpolation", 0, AV_OPT_TYPE_CONST, {.i64 = INTERP_BILINEAR}, 0, 0, TFLAGS, .unit = "interp" },
         { "lanczos", "lanczos2 interpolation", 0, AV_OPT_TYPE_CONST, {.i64 = INTERP_LANCZOS}, 0, 0, TFLAGS, .unit = "interp" },
-    { "layout", "layout JSON (VDO.Ninja subset)", OFFSET(layout_str), AV_OPT_TYPE_STRING, {0}, 0, 0, TFLAGS },
-    { "layout_file", "layout JSON file (polled each frame)", OFFSET(layout_file), AV_OPT_TYPE_STRING, {0}, 0, 0, TFLAGS },
+    { "layout", "preset name (single/split2/grid4/...) or layout JSON; ignored when layout_file is set",
+      OFFSET(layout_str), AV_OPT_TYPE_STRING, {0}, 0, 0, TFLAGS },
+    { "layout_file", "layout JSON file; wins over layout=. Edits are written back",
+      OFFSET(layout_file), AV_OPT_TYPE_STRING, {0}, 0, 0, TFLAGS },
     { "fill", "background fill color", OFFSET(fill_rgba), AV_OPT_TYPE_COLOR, {.str = "0x101010"}, 0, 0, TFLAGS },
     { "bg_input", "background plate + FrameSync clock (-1=use primary_input as clock)", OFFSET(bg_input), AV_OPT_TYPE_INT, {.i64 = 0}, -1, MIXING_CUDA_MAX_INPUTS - 1, TFLAGS },
     { "on_disconnect", "stall/disconnect behaviour", OFFSET(on_disconnect), AV_OPT_TYPE_INT, {.i64 = ON_DISC_FILL}, 0, 1, TFLAGS, .unit = "od" },
         { "fill", "keep layout, skip stalled panes", 0, AV_OPT_TYPE_CONST, {.i64 = ON_DISC_FILL}, 0, 0, TFLAGS, .unit = "od" },
-        { "collapse", "regrid active inputs (1-4 grid)", 0, AV_OPT_TYPE_CONST, {.i64 = ON_DISC_COLLAPSE}, 0, 0, TFLAGS, .unit = "od" },
+        { "collapse", "regrid active inputs with the ceiling preset", 0, AV_OPT_TYPE_CONST, {.i64 = ON_DISC_COLLAPSE}, 0, 0, TFLAGS, .unit = "od" },
     { "stall_ms", "Timeout (ms) after last fresh frame when not holding "
                   "(hard disconnect ->fill).",
             OFFSET(stall_ms), AV_OPT_TYPE_INT, {.i64 = 800}, 0, 60000, TFLAGS },
     { "hold_stall_ms", "Timeout (ms) while repeating last frame (dyn_hold). "
                        "Keep > GOP/keyframe wait so thumbs don't black on startup.",
             OFFSET(hold_stall_ms), AV_OPT_TYPE_INT, {.i64 = 3000}, 0, 60000, TFLAGS },
-    { "layout_mode", "layout mode", OFFSET(layout_mode), AV_OPT_TYPE_INT, {.i64 = LAYOUT_FIXED}, 0, 2, TFLAGS, .unit = "lm" },
-        { "adaptive", "auto grid by active count", 0, AV_OPT_TYPE_CONST, {.i64 = LAYOUT_ADAPTIVE}, 0, 0, TFLAGS, .unit = "lm" },
-        { "fixed",    "use JSON layout slots",    0, AV_OPT_TYPE_CONST, {.i64 = LAYOUT_FIXED}, 0, 0, TFLAGS, .unit = "lm" },
-        { "speaker",  "speaker-driven layout",    0, AV_OPT_TYPE_CONST, {.i64 = LAYOUT_SPEAKER}, 0, 0, TFLAGS, .unit = "lm" },
-    { "speaker_layout", "speaker layout style", OFFSET(speaker_layout), AV_OPT_TYPE_INT, {.i64 = SPK_OBS}, 0, 1, TFLAGS, .unit = "sl" },
-        { "obs",  "OBS-style: left main (~75% if <=4, else ~70%) + right strip", 0, AV_OPT_TYPE_CONST, {.i64 = SPK_OBS}, 0, 0, TFLAGS, .unit = "sl" },
-        { "grid", "grid-style: top main + bottom filmstrip", 0, AV_OPT_TYPE_CONST, {.i64 = SPK_GRID}, 0, 0, TFLAGS, .unit = "sl" },
+    { "layout_mode", "layout mode", OFFSET(layout_mode), AV_OPT_TYPE_INT, {.i64 = LAYOUT_FIXED}, 0, 1, TFLAGS, .unit = "lm" },
+        { "adaptive", "ceiling 16:9 preset by live input count", 0, AV_OPT_TYPE_CONST, {.i64 = LAYOUT_ADAPTIVE}, 0, 0, TFLAGS, .unit = "lm" },
+        { "fixed",    "layout_file, else layout= preset/JSON, else ceiling preset", 0, AV_OPT_TYPE_CONST, {.i64 = LAYOUT_FIXED}, 0, 0, TFLAGS, .unit = "lm" },
     { "rank_endpoint", "zmq SUB endpoint; ignored when task_id set "
-                       "(ipc:///data/LCMS/sock/gain_<id>.sock)", OFFSET(rank_endpoint), AV_OPT_TYPE_STRING, {0}, 0, 0, TFLAGS },
+                       "(ipc:///data/sock/gain_<id>.sock)", OFFSET(rank_endpoint), AV_OPT_TYPE_STRING, {0}, 0, 0, TFLAGS },
     { "task_id", "LCMS task id; prefer ipc gain sock (also -task_id / FFMPEG_TASK_ID)", OFFSET(task_id), AV_OPT_TYPE_INT, {.i64=0}, 0, INT_MAX, TFLAGS },
     { "speaker_hold_ms", "speaker switch hold time (ms)", OFFSET(speaker_hold_ms), AV_OPT_TYPE_INT, {.i64 = 500}, 0, 60000, TFLAGS },
-    { "join_stable_ms", "Require continuous live this long before adaptive/speaker layout join "
+    { "join_stable_ms", "Require continuous live this long before adaptive layout join "
                         "(smooths remove->later update cold insert).",
             OFFSET(join_stable_ms), AV_OPT_TYPE_INT, {.i64 = 300}, 0, 5000, TFLAGS },
     { "speaker_switch_db", "speaker switch loudness diff (dB)", OFFSET(speaker_switch_db), AV_OPT_TYPE_FLOAT, {.dbl = 6.0}, 0, 60, TFLAGS },
-    { "speaker_switch", "1=follow amixrank incentive; place speaker in largest/front "
-                        "adapt cell (fixed: highlight only). 0=manual active_speaker",
+    { "speaker_switch", "1=follow amixrank incentive (adaptive: speaker in first/top cell; "
+                        "fixed: highlight only). 0=manual active_speaker",
             OFFSET(speaker_switch), AV_OPT_TYPE_BOOL, {.i64 = 1}, 0, 1, TFLAGS },
     { "primary_input", "fallback clock input when bg_input=-1 (do NOT point at dynamic RTMP)", OFFSET(primary_input), AV_OPT_TYPE_INT, {.i64 = 0}, 0, MIXING_CUDA_MAX_INPUTS - 1, TFLAGS },
     { "border_px", "speaker highlight border width in pixels (0=off; may thicken tile border)", OFFSET(border_px), AV_OPT_TYPE_INT, {.i64 = 4}, 0, 64, TFLAGS },
@@ -2805,7 +2859,7 @@ static const AVOption mixing_cuda_options[] = {
         { "fly_up",      "fly in from bottom with fade",0, AV_OPT_TYPE_CONST, {.i64 = TRANS_FLY_UP},      0, 0, TFLAGS, .unit = "trans" },
         { "fly_down",    "fly in from top with fade",   0, AV_OPT_TYPE_CONST, {.i64 = TRANS_FLY_DOWN},    0, 0, TFLAGS, .unit = "trans" },
     { "trans_ms", "tile transition duration in milliseconds (0=off)",
-      OFFSET(trans_ms), AV_OPT_TYPE_INT, {.i64 = 2000}, 0, 5000, TFLAGS },
+      OFFSET(trans_ms), AV_OPT_TYPE_INT, {.i64 = 1200}, 0, 5000, TFLAGS },
     { "sync_warn_interval_ms", "Min interval between mix_sync warnings for one pad",
       OFFSET(sync_warn_interval_ms), AV_OPT_TYPE_INT, {.i64 = 10000}, 1000, 600000, TFLAGS },
     { "eof_action", "action when an input reaches EOF",

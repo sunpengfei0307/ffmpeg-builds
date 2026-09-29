@@ -299,27 +299,52 @@ static int ist_match(InputStream *ist, const ZmqTarget *t, int *type_counter)
     return 1;
 }
 
-static int dispatch_filters(const ZmqTarget *t, const char *cmd, const char *arg)
+static int dispatch_filters(const ZmqTarget *t, const char *cmd, const char *arg,
+                            char *res, int res_len)
 {
     const char *target = t->name[0] ? t->name : "all";
     int n = 0;
+    int ret = AVERROR(ENOSYS);
+    char piece[8192];
 
     for (OutputStream *ost = ost_iter(NULL); ost; ost = ost_iter(ost)) {
+        int r;
+
         if (!ost->fg_simple)
             continue;
         if (t->graph_idx >= 0 && ost->fg_simple->index != t->graph_idx)
             continue;
-        fg_send_command(ost->fg_simple, -1, target, cmd, arg, 0);
+        piece[0] = 0;
+        r = fg_send_command_wait(ost->fg_simple, -1, target, cmd, arg, 0,
+                                 piece, sizeof(piece), 5000);
         n++;
+        if (r == AVERROR(ENOSYS))
+            continue;
+        ret = r;
+        if (res && res_len > 0 && piece[0])
+            av_strlcpy(res, piece, res_len);
+        if (r != AVERROR(EAGAIN))
+            return ret;
     }
     for (int i = 0; i < nb_filtergraphs; i++) {
         FilterGraph *fg = filtergraphs[i];
+        int r;
+
         if (t->graph_idx >= 0 && fg->index != t->graph_idx)
             continue;
-        fg_send_command(fg, -1, target, cmd, arg, 0);
+        piece[0] = 0;
+        r = fg_send_command_wait(fg, -1, target, cmd, arg, 0,
+                                 piece, sizeof(piece), 5000);
         n++;
+        if (r == AVERROR(ENOSYS))
+            continue;
+        ret = r;
+        if (res && res_len > 0 && piece[0])
+            av_strlcpy(res, piece, res_len);
+        if (r != AVERROR(EAGAIN))
+            return ret;
     }
-    return n > 0 ? 0 : AVERROR(ENODEV);
+    return n > 0 ? ret : AVERROR(ENODEV);
 }
 
 static int merge_cmd_ret(int acc, int ret, int *hits)
@@ -352,7 +377,7 @@ static int dispatch_one(const ZmqTarget *t, const char *cmd, const char *arg,
 
     switch (t->kind) {
     case ZK_FILTER:
-        return dispatch_filters(t, cmd, arg);
+        return dispatch_filters(t, cmd, arg, res, res_len);
     case ZK_ENC:
         for (OutputStream *ost = ost_iter(NULL); ost; ost = ost_iter(ost)) {
             int r;
@@ -497,7 +522,7 @@ static void *zmq_worker(void *arg)
     (void)arg;
     while (atomic_load(&zmq_running)) {
         char *recv = NULL;
-        char reply[1536], res[1024];
+        char reply[256], res[8192];
         char *send_buf = NULL;
         int ret;
 
@@ -515,6 +540,9 @@ static void *zmq_worker(void *arg)
             }
             memcpy(line, recv, n);
             line[n] = 0;
+            while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r' ||
+                             line[n - 1] == ' ' || line[n - 1] == '\t'))
+                line[--n] = 0;
             free(recv);
             recv = line;
         }

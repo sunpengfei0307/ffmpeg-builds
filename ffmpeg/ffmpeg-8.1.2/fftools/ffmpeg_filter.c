@@ -19,6 +19,8 @@
  */
 
 #include <stdint.h>
+#include <pthread.h>
+#include <time.h>
 
 #include "ffmpeg.h"
 #include "graph/graphprint.h"
@@ -251,6 +253,15 @@ static OutputFilterPriv *ofp_from_ofilter(OutputFilter *ofilter)
     return (OutputFilterPriv*)ofilter;
 }
 
+typedef struct FilterCmdSync {
+    pthread_mutex_t mu;
+    pthread_cond_t  cv;
+    int             done;
+    int             abandoned;
+    int             ret;
+    char            res[8192];
+} FilterCmdSync;
+
 typedef struct FilterCommand {
     char *target;
     char *command;
@@ -258,6 +269,7 @@ typedef struct FilterCommand {
 
     double time;
     int    all_filters;
+    FilterCmdSync *sync;
 } FilterCommand;
 
 static void filter_command_free(void *opaque, uint8_t *data)
@@ -2325,29 +2337,56 @@ int filtergraph_is_simple(const FilterGraph *fg)
     return fgp->is_simple;
 }
 
-static void send_command(FilterGraph *fg, AVFilterGraph *graph,
-                         double time, const char *target,
-                         const char *command, const char *arg, int all_filters)
+static void filter_cmd_sync_finish(FilterCmdSync *sync, int ret)
 {
-    int ret;
+    int abandoned;
 
-    if (!graph)
+    if (!sync)
         return;
+    pthread_mutex_lock(&sync->mu);
+    sync->ret = ret;
+    sync->done = 1;
+    abandoned = sync->abandoned;
+    pthread_cond_signal(&sync->cv);
+    pthread_mutex_unlock(&sync->mu);
+    if (abandoned) {
+        pthread_cond_destroy(&sync->cv);
+        pthread_mutex_destroy(&sync->mu);
+        av_free(sync);
+    }
+}
 
-    if (time < 0) {
-        char response[4096];
-        ret = avfilter_graph_send_command(graph, target, command, arg,
-                                          response, sizeof(response),
-                                          all_filters ? 0 : AVFILTER_CMD_FLAG_ONE);
+static void send_command(FilterGraph *fg, AVFilterGraph *graph, FilterCommand *fc)
+{
+    char stack_res[4096];
+    char *response = stack_res;
+    int res_len = sizeof(stack_res);
+    int ret = 0;
+
+    if (fc->sync) {
+        response = fc->sync->res;
+        res_len = (int)sizeof(fc->sync->res);
+        response[0] = 0;
+    }
+
+    if (!graph) {
+        ret = AVERROR(EAGAIN);
+    } else if (fc->time < 0) {
+        ret = avfilter_graph_send_command(graph, fc->target, fc->command, fc->arg,
+                                          response, res_len,
+                                          fc->all_filters ? 0 : AVFILTER_CMD_FLAG_ONE);
         fprintf(stderr, "Command reply for stream %d: ret:%d res:\n%s",
                 fg->index, ret, response);
-    } else if (!all_filters) {
+    } else if (!fc->all_filters) {
         fprintf(stderr, "Queuing commands only on filters supporting the specific command is unsupported\n");
+        ret = AVERROR(ENOSYS);
     } else {
-        ret = avfilter_graph_queue_command(graph, target, command, arg, 0, time);
+        ret = avfilter_graph_queue_command(graph, fc->target, fc->command,
+                                           fc->arg, 0, fc->time);
         if (ret < 0)
             fprintf(stderr, "Queuing command failed with error %s\n", av_err2str(ret));
     }
+    filter_cmd_sync_finish(fc->sync, ret);
 }
 
 static int choose_input(const FilterGraph *fg, const FilterGraphThread *fgt)
@@ -3346,8 +3385,7 @@ static int filter_thread(void *arg)
             av_assert0(o == FRAME_OPAQUE_SEND_COMMAND && fgt.frame->buf[0]);
 
             fc = (FilterCommand*)fgt.frame->buf[0]->data;
-            send_command(fg, fgt.graph, fc->time, fc->target, fc->command, fc->arg,
-                         fc->all_filters);
+            send_command(fg, fgt.graph, fc);
             av_frame_unref(fgt.frame);
             continue;
         }
@@ -3423,36 +3461,109 @@ finish:
     return ret;
 }
 
-void fg_send_command(FilterGraph *fg, double time, const char *target,
-                     const char *command, const char *arg, int all_filters)
+static int fg_enqueue_command(FilterGraph *fg, double time, const char *target,
+                              const char *command, const char *arg, int all_filters,
+                              FilterCmdSync *sync)
 {
     FilterGraphPriv *fgp = fgp_from_fg(fg);
     AVBufferRef *buf;
     FilterCommand *fc;
+    int ret;
 
     fc = av_mallocz(sizeof(*fc));
     if (!fc)
-        return;
+        return AVERROR(ENOMEM);
 
     buf = av_buffer_create((uint8_t*)fc, sizeof(*fc), filter_command_free, NULL, 0);
     if (!buf) {
         av_freep(&fc);
-        return;
+        return AVERROR(ENOMEM);
     }
 
-    fc->target  = av_strdup(target);
-    fc->command = av_strdup(command);
-    fc->arg     = av_strdup(arg);
+    fc->target  = av_strdup(target ? target : "");
+    fc->command = av_strdup(command ? command : "");
+    fc->arg     = av_strdup(arg ? arg : "");
     if (!fc->target || !fc->command || !fc->arg) {
         av_buffer_unref(&buf);
-        return;
+        return AVERROR(ENOMEM);
     }
 
     fc->time        = time;
     fc->all_filters = all_filters;
+    fc->sync        = sync;
 
     fgp->frame->buf[0] = buf;
     fgp->frame->opaque = (void*)(intptr_t)FRAME_OPAQUE_SEND_COMMAND;
 
-    sch_filter_command(fgp->sch, fgp->sch_idx, fgp->frame);
+    ret = sch_filter_command(fgp->sch, fgp->sch_idx, fgp->frame);
+    if (ret < 0) {
+        fc->sync = NULL;
+        av_buffer_unref(&fgp->frame->buf[0]);
+        return ret;
+    }
+    return 0;
+}
+
+void fg_send_command(FilterGraph *fg, double time, const char *target,
+                     const char *command, const char *arg, int all_filters)
+{
+    fg_enqueue_command(fg, time, target, command, arg, all_filters, NULL);
+}
+
+int fg_send_command_wait(FilterGraph *fg, double cmd_time, const char *target,
+                         const char *command, const char *arg, int all_filters,
+                         char *res, int res_len, int timeout_ms)
+{
+    FilterCmdSync *sync;
+    struct timespec ts;
+    int ret;
+
+    if (timeout_ms <= 0)
+        timeout_ms = 5000;
+    sync = av_mallocz(sizeof(*sync));
+    if (!sync)
+        return AVERROR(ENOMEM);
+    pthread_mutex_init(&sync->mu, NULL);
+    pthread_cond_init(&sync->cv, NULL);
+    sync->ret = AVERROR(ETIMEDOUT);
+
+    ret = fg_enqueue_command(fg, cmd_time, target, command, arg, all_filters, sync);
+    if (ret < 0) {
+        pthread_cond_destroy(&sync->cv);
+        pthread_mutex_destroy(&sync->mu);
+        av_free(sync);
+        return ret;
+    }
+
+    if (clock_gettime(CLOCK_REALTIME, &ts) != 0) {
+        ts.tv_sec = time(NULL);
+        ts.tv_nsec = 0;
+    }
+    ts.tv_sec += timeout_ms / 1000;
+    ts.tv_nsec += (long)(timeout_ms % 1000) * 1000000L;
+    if (ts.tv_nsec >= 1000000000L) {
+        ts.tv_sec++;
+        ts.tv_nsec -= 1000000000L;
+    }
+
+    pthread_mutex_lock(&sync->mu);
+    while (!sync->done) {
+        if (pthread_cond_timedwait(&sync->cv, &sync->mu, &ts) == ETIMEDOUT)
+            break;
+    }
+    if (!sync->done) {
+        sync->abandoned = 1;
+        pthread_mutex_unlock(&sync->mu);
+        if (res && res_len > 0)
+            res[0] = 0;
+        return AVERROR(ETIMEDOUT);
+    }
+    ret = sync->ret;
+    if (res && res_len > 0)
+        av_strlcpy(res, sync->res, res_len);
+    pthread_mutex_unlock(&sync->mu);
+    pthread_cond_destroy(&sync->cv);
+    pthread_mutex_destroy(&sync->mu);
+    av_free(sync);
+    return ret;
 }

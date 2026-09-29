@@ -1044,6 +1044,19 @@ static int transcode(Scheduler *sch)
     if (ret < 0)
         return ret;
 
+    if ((!ffmpeg_zmq_url || !ffmpeg_zmq_url[0]) && task_id != 0) {
+        char zbuf[128];
+        snprintf(zbuf, sizeof(zbuf), "ipc:///data/socks/%d_cmd.sock", task_id);
+        av_freep(&ffmpeg_zmq_url);
+        ffmpeg_zmq_url = av_strdup(zbuf);
+        if (!ffmpeg_zmq_url)
+            av_log(NULL, AV_LOG_ERROR, "-task_id %d: default -zmq alloc failed\n", task_id);
+        else
+            av_log(NULL, AV_LOG_INFO,
+                   "-task_id %d: default -zmq %s (override with -zmq)\n",
+                   task_id, ffmpeg_zmq_url);
+    }
+
     ret = ffmpeg_zmq_init(ffmpeg_zmq_url);
     if (ret < 0)
         av_log(NULL, AV_LOG_ERROR, "process ZMQ init failed: %s\n", av_err2str(ret));

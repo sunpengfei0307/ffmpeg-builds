@@ -83,6 +83,11 @@ void tq_choke(ThreadQueue *tq, int choked);
  */
 int tq_receive(ThreadQueue *tq, int *stream_idx, void *data);
 /**
+ * Like tq_receive(), but return AVERROR(EAGAIN) immediately when the queue
+ * has no item instead of blocking.
+ */
+int tq_receive_try(ThreadQueue *tq, int *stream_idx, void *data);
+/**
  * Mark the given stream finished from the receiving side.
  */
 void tq_receive_finish(ThreadQueue *tq, unsigned int stream_idx);

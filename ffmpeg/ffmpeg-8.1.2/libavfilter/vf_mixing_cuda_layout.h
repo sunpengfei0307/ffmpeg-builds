@@ -1,12 +1,11 @@
 /*
- * Built-in equal (gallery) + speaker (spotlight) layouts for mixing_cuda.
- * Percentages are 0..100 relative to the output canvas.
- * Pixel constants (PAD/GAP/SIDE/BOTTOM) are converted using out_w/out_h.
+ * 16:9 preset layouts for mixing_cuda.
+ * Geometry matches the director console landscape layoutGeometry()
+ * (gap in 1080p px, then inset as a percent of 1920x1080).
+ * Percentages are 0..100 of the output canvas.
  */
 #ifndef AVFILTER_VF_MIXING_CUDA_LAYOUT_H
 #define AVFILTER_VF_MIXING_CUDA_LAYOUT_H
-
-#include <stddef.h>
 
 #define MIXING_LAYOUT_MAX 32
 
@@ -15,27 +14,29 @@ typedef struct MixingLayoutRect {
 } MixingLayoutRect;
 
 /**
- * Equal / gallery tiling (16:9-optimal cols×rows + PAD/GAP).
- * Used by adaptive and fixed JSON fallback.
- * @param n       number of tiles (1..MIXING_LAYOUT_MAX)
- * @param out_w   canvas width in px (≤0 → 1920)
- * @param out_h   canvas height in px (≤0 → 1080)
- * @param out     caller buffer of size >= n
- * @return number of rects written, or 0 if n invalid
+ * Canonical preset id, or NULL if name is unknown.
+ * Accepts console ids and legacy aliases (1/2/4/9, grid, quad, hsplit, vsplit, 2v1).
  */
-int ff_mixing_layout_equal(int n, int out_w, int out_h, MixingLayoutRect *out);
+const char *ff_mixing_layout_canon(const char *name);
 
 /**
- * Speaker spotlight (1080p ref: main 1432x806, thumb 468x256, gap 16).
- * @param n_alive  total alive including speaker (1..MIXING_LAYOUT_MAX)
- * @param style    0=obs (side if ≤3 thumbs / n≤4, else bottom),
- *                 1=grid (always bottom filmstrip)
- * @param out_w    canvas width in px (≤0 → 1920)
- * @param out_h    canvas height in px (≤0 → 1080)
- * @param out      rects[0] is always the main/speaker pane; then thumbnails
- * @return number of rects written
+ * Landscape 16:9 preset. Writes one rect per slot of that preset.
+ * @return slot count, or 0 if name is unknown / out is too small
  */
-int ff_mixing_layout_speaker(int n_alive, int style, int out_w, int out_h,
-                             MixingLayoutRect *out);
+int ff_mixing_layout_by_name(const char *name, MixingLayoutRect *out, int cap);
+
+/**
+ * Smallest default preset whose slot count is >= n (round up):
+ * 1 single, 2 split2, 3 grid3, 4 grid4, 5–6 grid6, 7–9 grid9, 10–16 grid16.
+ * n>16 is a 4-column extension of grid16 (gap 8); the name is "grid4col".
+ */
+const char *ff_mixing_layout_ceil_name(int n);
+
+/**
+ * Full geometry of the ceiling preset for n inputs.
+ * A count of 5 returns all 6 cells of grid6; the caller fills the first n.
+ * @return number of rects, or 0 if n/out invalid
+ */
+int ff_mixing_layout_for_count(int n, MixingLayoutRect *out, int cap);
 
 #endif /* AVFILTER_VF_MIXING_CUDA_LAYOUT_H */

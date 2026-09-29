@@ -69,7 +69,7 @@ Three cooperating filters form an OBS-style live meeting compositor:
 
 - `vf_dynamic_input` — multi-source CUDA video source (outputs=16 pads, per-stream
   RTMP pull + CUDA hwdec, runtime add/remove/switch/clear via zmq or sendcmd).
-- `mixing_cuda` — video compositor with three layout modes (adaptive/fixed/speaker),
+- `mixing_cuda` — video compositor with two layout modes (adaptive/fixed),
   logical activate/deactivate, zmq SUB loudness-driven speaker switching, CUevent
   pipeline, and FrameSync anti-blocking sync strategy.
 - `af_amixrank` — audio mixer with per-input loudness measurement, ranking, zmq PUB
@@ -81,7 +81,7 @@ Three cooperating filters form an OBS-style live meeting compositor:
 -init_hw_device cuda=hw -filter_hw_device hw
 color_cuda=c=0x101010:s=1920x1080:r=25[bg];
 vf_dynamic_input=outputs=16:device=hw:sw_format=nv12:s=1920x1080:r=25:initial_urls=rtmp://u0,rtmp://u1[v0][v1][v2][v3][v4][v5][v6][v7][v8][v9][v10][v11][v12][v13][v14][v15];
-[bg][v0][v1][v2][v3][v4][v5][v6][v7][v8][v9][v10][v11][v12][v13][v14][v15]mixing_cuda=inputs=16:s=1920x1080:layout_mode=speaker:rank_endpoint=tcp://127.0.0.1:5556:speaker_layout=obs:primary_input=0:speaker_hold_ms=500:speaker_switch_db=6[vout]
+[bg][v0][v1][v2][v3][v4][v5][v6][v7][v8][v9][v10][v11][v12][v13][v14][v15]mixing_cuda=inputs=16:s=1920x1080:layout_mode=adaptive:rank_endpoint=tcp://127.0.0.1:5556:primary_input=0:speaker_hold_ms=500:speaker_switch_db=6[vout]
 anullsrc=r=48000:cl=stereo[asil];
 [asil][0:a][1:a][2:a][3:a][4:a][5:a][6:a][7:a][8:a][9:a][10:a][11:a][12:a][13:a][14:a][15:a]amixrank=inputs=16:rank_endpoint=tcp://127.0.0.1:5556:ducking=1:duck_gain_db=-18:rank_interval_ms=100[aout]
 ```
@@ -105,12 +105,9 @@ set_active 3 1              # re-activate slot 3
 ```text
 set_active 3 0              # deactivate input 3 (renders fill, anull)
 set_active 3 1              # re-activate
-active_speaker 2            # manually set main speaker
-speaker_layout obs          # OBS-style: speaker 70% + thumbnails
-speaker_layout grid         # grid-style: speaker largest cell
-layout_mode adaptive        # auto 1~9 grid by active count
-layout_mode fixed           # JSON layout
-layout_mode speaker         # zmq-driven speaker layout
+active_speaker 2            # manually set main speaker (speaker_switch=0)
+layout_mode adaptive        # auto equal grid by live count
+layout_mode fixed           # JSON file/string, or input-count grid
 ```
 
 ## Ducking (amixrank)

@@ -6,6 +6,7 @@
 
 | 日期 | 说明 |
 |------|------|
+| 2026-09-22 | 输出 pad 可用 `[v0-v15][a0-a15]`（图解析层展开，与逐个列出等价） |
 | 2026-08-06 | 成片嘴型：恢复 A/V **共享 due** 放行；仅丢落后于已放音频的旧画，禁止“声走、画 hold”拆节目轴 |
 | 2026-08-06 | `|A−V|≤80ms` 静默；异常 `dyn_sync` WARNING（cause/fix） |
 | 2026-08-06 | 文档独立成册（自合屏文档拆分参数/命令要点） |
@@ -58,10 +59,10 @@
 
 ```text
 # 4 路会议
-dynamic_input=outputs=4:enable_audio=1:live=1:s=1920x1080:r=25:sample_rate=48000:playout_delay_ms=40:av_wait_ms=6000:pts_jump_s=10:initial_urls=rtmp://u0\,rtmp://u1\,rtmp://u2\,rtmp://u3
+dynamic_input=outputs=4:enable_audio=1:live=1:s=1920x1080:r=25:sample_rate=48000:playout_delay_ms=40:av_wait_ms=6000:pts_jump_s=10:initial_urls=rtmp://u0\,rtmp://u1\,rtmp://u2\,rtmp://u3[v0-v3][a0-a3]
 
 # 16 路预留、只开 1 路
-dynamic_input=outputs=16:enable_audio=1:live=1:s=1920x1080:r=25:sample_rate=48000:initial_urls=rtmp://host/live/u0
+dynamic_input=outputs=16:enable_audio=1:live=1:s=1920x1080:r=25:sample_rate=48000:initial_urls=rtmp://host/live/u0[v0-v15][a0-a15]
 ```
 
 ### 运行时命令（经统一 zmq）
@@ -79,6 +80,7 @@ dynamic_input purge
 ## 注意事项
 
 - 插槽 0 是底色，不走本滤镜命令
+- 输出 pad 可用区间：`[v0-v15][a0-a15]`（亦可 `[v0-15]`）；32 路写 `[v0-v31][a0-a31]`
 - `r` 不随输入 25↔50 自动改变
 - 废弃：`cmd_*.sock`、`add`/`switch`
 

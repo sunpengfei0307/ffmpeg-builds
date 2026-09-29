@@ -2007,7 +2007,12 @@ zmqbuf_recv(IZeromq* self, void** buff, size_t capa, long timeout) {
     size_t size = 0;
     TryCatch((size = zmq_recv(self->sock, *buff, capa, ZMQ_DONTWAIT)) == -1,
 		"zmqbuf_recv failed: %s", zmq_strerror(errno));
-	dbg("@buff[%zu]='%s'\n", size, (char *)*buff);
+	{
+		size_t shown = (size_t)size < capa ? (size_t)size : capa;
+		if (shown < capa)
+			((char *)*buff)[shown] = 0;
+		dbg("@buff[%zu]='%.*s'\n", size, (int)shown, (char *)*buff);
+	}
 	return size;
 Exception:
 	return -1;
@@ -2034,7 +2039,7 @@ zmqmsg_send(IZeromq* self, void *buff, size_t size, long timeout){
 	memcpy(zmq_msg_data(&msg), buff, size);
 	TryCatch((zmq_msg_send(&msg, self->sock, ZMQ_DONTWAIT) == -1),
 		"zmqmsg_send failed: %s", zmq_strerror(errno));
-	msg("@buff[%zu]='%s'\n", size, (char *)buff);
+	msg("@buff[%zu]='%.*s'\n", size, (int)size, (char *)buff);
 	return size;
 Exception:
 	zmq_msg_close(&msg);
@@ -2068,15 +2073,19 @@ zmqmsg_recv(IZeromq* self, void **pbuf, size_t capa, long timeout)
     TryCatch((zmq_msg_recv(&msg, self->sock, ZMQ_DONTWAIT) == -1),
 		"zmqmsg_recv failed: %s", zmq_strerror(errno));
     size_t size = zmq_msg_size(&msg);
+	int auto_alloc = 0;
 	if (*pbuf != NULL) {
 		TryCatch(capa < size, "caller's buff not enough!");
 	} else {
-		*pbuf = calloc(1, size); // auto alloc .
+		*pbuf = calloc(1, size + 1); // auto alloc, extra NUL for %s logs.
+		auto_alloc = 1;
 	}
 	Assertor (*pbuf != NULL);
     memcpy(*pbuf, zmq_msg_data(&msg), size);
+	if (auto_alloc || capa > size)
+		((char *)*pbuf)[size] = 0;
     zmq_msg_close(&msg); // needed.
-	msg("@buff[%zu]='%s'\n", size, (char *)*pbuf);
+	msg("@buff[%zu]='%.*s'\n", size, (int)size, (char *)*pbuf);
 	return size;
 Exception:
     zmq_msg_close(&msg);

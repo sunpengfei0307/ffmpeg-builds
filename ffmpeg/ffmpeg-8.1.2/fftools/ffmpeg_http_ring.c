@@ -4,8 +4,10 @@
 
 #include "ffmpeg_http_ring.h"
 
+#include <errno.h>
 #include <string.h>
 
+#include "libavutil/error.h"
 #include "libavutil/mem.h"
 
 HttpLiveBuf *http_livebuf_alloc(const uint8_t *data, int size, int is_key)
@@ -53,119 +55,166 @@ void http_livebuf_unref(HttpLiveBuf **pb)
         *pb = NULL;
 }
 
-void http_ring_init(HttpPtrRing *r)
+int http_ring_init(HttpPtrRing *r, unsigned capacity, uint64_t max_bytes)
 {
-    if (!r)
-        return;
+    int ret;
+
+    if (!r || !capacity || !max_bytes)
+        return AVERROR(EINVAL);
     memset(r, 0, sizeof(*r));
     atomic_init(&r->wpos, 0);
-    atomic_init(&r->gop_pos, 0);
+    atomic_init(&r->oldest, 0);
+    r->slots = av_calloc(capacity, sizeof(*r->slots));
+    if (!r->slots)
+        return AVERROR(ENOMEM);
+    ret = pthread_mutex_init(&r->lock, NULL);
+    if (ret) {
+        av_freep(&r->slots);
+        return AVERROR(ret);
+    }
+    r->capacity = capacity;
+    r->max_bytes = max_bytes;
+    r->latest_sync = HTTP_RING_NO_SYNC;
+    return 0;
+}
+
+static uint64_t http_ring_find_latest_sync(const HttpPtrRing *r)
+{
+    uint64_t seq;
+    uint64_t oldest = atomic_load_explicit(&r->oldest, memory_order_relaxed);
+
+    for (seq = atomic_load_explicit(&r->wpos, memory_order_relaxed);
+         seq > oldest; seq--) {
+        const HttpRingSlot *slot = &r->slots[(seq - 1) % r->capacity];
+
+        if (slot->buf && slot->seq == seq - 1 && slot->buf->is_key)
+            return seq - 1;
+    }
+    return HTTP_RING_NO_SYNC;
+}
+
+static void http_ring_evict_oldest(HttpPtrRing *r)
+{
+    HttpRingSlot *slot;
+    uint64_t oldest = atomic_load_explicit(&r->oldest, memory_order_relaxed);
+    int evicted_latest_sync = 0;
+
+    if (oldest == atomic_load_explicit(&r->wpos, memory_order_relaxed))
+        return;
+    slot = &r->slots[oldest % r->capacity];
+    if (slot->buf && slot->seq == oldest) {
+        evicted_latest_sync = slot->seq == r->latest_sync;
+        r->bytes -= slot->buf->size;
+        http_livebuf_unref(&slot->buf);
+    }
+    atomic_store_explicit(&r->oldest, oldest + 1, memory_order_release);
+    if (evicted_latest_sync)
+        r->latest_sync = http_ring_find_latest_sync(r);
 }
 
 void http_ring_push(HttpPtrRing *r, HttpLiveBuf *b)
 {
-    unsigned pos, slot;
-    HttpLiveBuf *old;
+    HttpRingSlot *slot;
+    uint64_t seq;
 
-    if (!r || !b)
+    if (!r || !r->slots || !b)
         return;
-    pos = atomic_load_explicit(&r->wpos, memory_order_relaxed);
-    slot = pos % HTTP_RING_CAP;
-    old = r->slots[slot];
-    r->slots[slot] = http_livebuf_ref(b);
-    atomic_store_explicit(&r->wpos, pos + 1, memory_order_release);
-    if (old)
-        http_livebuf_unref(&old);
+    pthread_mutex_lock(&r->lock);
+    while (atomic_load_explicit(&r->wpos, memory_order_relaxed) -
+           atomic_load_explicit(&r->oldest, memory_order_relaxed) >= r->capacity)
+        http_ring_evict_oldest(r);
+    seq = atomic_load_explicit(&r->wpos, memory_order_relaxed);
+    slot = &r->slots[seq % r->capacity];
+    slot->buf = http_livebuf_ref(b);
+    slot->seq = seq;
+    r->bytes += b->size;
+    atomic_store_explicit(&r->wpos, seq + 1, memory_order_release);
+    if (b->is_key)
+        r->latest_sync = seq;
+    while (r->bytes > r->max_bytes)
+        http_ring_evict_oldest(r);
+    pthread_mutex_unlock(&r->lock);
 }
 
-HttpLiveBuf *http_ring_get(HttpPtrRing *r, unsigned idx)
+int http_ring_get(HttpPtrRing *r, uint64_t seq, HttpLiveBuf **out)
 {
-    unsigned w, slot;
-    HttpLiveBuf *b;
+    HttpRingSlot *slot;
+    int ret = 0;
 
-    if (!r)
-        return NULL;
-    w = atomic_load_explicit(&r->wpos, memory_order_acquire);
-    if (idx == w || (unsigned)(w - idx) > HTTP_RING_CAP)
-        return NULL;
-    slot = idx % HTTP_RING_CAP;
-    b = r->slots[slot];
-    if (!b)
-        return NULL;
-    http_livebuf_ref(b);
-    /* Writer may have overwritten this slot after we loaded the pointer.
-     * Re-check so we never send a future fragment as the current one. */
-    w = atomic_load_explicit(&r->wpos, memory_order_acquire);
-    if (idx == w || (unsigned)(w - idx) > HTTP_RING_CAP) {
-        http_livebuf_unref(&b);
-        return NULL;
+    if (out)
+        *out = NULL;
+    if (!r || !r->slots || !out)
+        return AVERROR(EINVAL);
+    pthread_mutex_lock(&r->lock);
+    if (seq < atomic_load_explicit(&r->oldest, memory_order_relaxed)) {
+        ret = AVERROR(ESTALE);
+    } else if (seq >= atomic_load_explicit(&r->wpos, memory_order_relaxed)) {
+        ret = AVERROR(EAGAIN);
+    } else {
+        slot = &r->slots[seq % r->capacity];
+        if (!slot->buf || slot->seq != seq)
+            ret = AVERROR(ESTALE);
+        else
+            *out = http_livebuf_ref(slot->buf);
     }
-    return b;
+    pthread_mutex_unlock(&r->lock);
+    return ret;
 }
 
-int http_ring_stale(const HttpPtrRing *r, unsigned idx)
+uint64_t http_ring_wpos(const HttpPtrRing *r)
 {
-    unsigned w;
-
-    if (!r)
-        return 1;
-    w = atomic_load_explicit(&r->wpos, memory_order_acquire);
-    /* Caught up (idx == w) is empty, not stale. Overwritten only. */
-    return idx != w && (unsigned)(w - idx) > HTTP_RING_CAP;
-}
-
-unsigned http_ring_valid_gop(const HttpPtrRing *r)
-{
-    unsigned w, oldest, i;
-
     if (!r)
         return 0;
-    w = atomic_load_explicit(&r->wpos, memory_order_acquire);
-    oldest = w > HTTP_RING_CAP ? w - HTTP_RING_CAP : 0;
-    if (w == oldest)
-        return w;
-    /* Prefer last keyframe fragment still in the window. Do not fall back
-     * to oldest: a P-frame / mid-moof start is Invalid NAL 0 / no frame. */
-    for (i = w; i > oldest; i--) {
-        HttpLiveBuf *b = r->slots[(i - 1) % HTTP_RING_CAP];
-        if (b && b->is_key)
-            return i - 1;
-    }
-    return w;
+    return atomic_load_explicit(&r->wpos, memory_order_acquire);
 }
 
-unsigned http_ring_oldest(const HttpPtrRing *r)
+uint64_t http_ring_oldest(const HttpPtrRing *r)
 {
-    unsigned w = http_ring_wpos(r);
-    return w > HTTP_RING_CAP ? w - HTTP_RING_CAP : 0;
+    if (!r)
+        return 0;
+    return atomic_load_explicit(&r->oldest, memory_order_acquire);
 }
 
-unsigned http_ring_wpos(const HttpPtrRing *r)
+uint64_t http_ring_latest_sync(HttpPtrRing *r)
 {
-    return r ? atomic_load_explicit(&r->wpos, memory_order_acquire) : 0;
-}
+    uint64_t latest_sync;
 
-unsigned http_ring_gop(const HttpPtrRing *r)
-{
-    return r ? atomic_load_explicit(&r->gop_pos, memory_order_acquire) : 0;
-}
-
-void http_ring_mark_gop(HttpPtrRing *r, unsigned pos)
-{
-    if (r)
-        atomic_store_explicit(&r->gop_pos, pos, memory_order_release);
+    if (!r)
+        return HTTP_RING_NO_SYNC;
+    pthread_mutex_lock(&r->lock);
+    latest_sync = r->latest_sync;
+    pthread_mutex_unlock(&r->lock);
+    return latest_sync;
 }
 
 void http_ring_clear(HttpPtrRing *r)
 {
-    int i;
-
-    if (!r)
+    if (!r || !r->slots)
         return;
-    for (i = 0; i < HTTP_RING_CAP; i++) {
-        if (r->slots[i])
-            http_livebuf_unref(&r->slots[i]);
-    }
+    pthread_mutex_lock(&r->lock);
+    while (atomic_load_explicit(&r->oldest, memory_order_relaxed) !=
+           atomic_load_explicit(&r->wpos, memory_order_relaxed))
+        http_ring_evict_oldest(r);
+    r->bytes = 0;
+    r->latest_sync = HTTP_RING_NO_SYNC;
+    pthread_mutex_unlock(&r->lock);
+}
+
+void http_ring_destroy(HttpPtrRing *r)
+{
+    if (!r || !r->slots)
+        return;
+    pthread_mutex_lock(&r->lock);
+    while (atomic_load_explicit(&r->oldest, memory_order_relaxed) !=
+           atomic_load_explicit(&r->wpos, memory_order_relaxed))
+        http_ring_evict_oldest(r);
+    av_freep(&r->slots);
+    r->capacity = 0;
+    r->max_bytes = 0;
+    r->bytes = 0;
     atomic_store_explicit(&r->wpos, 0, memory_order_relaxed);
-    atomic_store_explicit(&r->gop_pos, 0, memory_order_relaxed);
+    atomic_store_explicit(&r->oldest, 0, memory_order_relaxed);
+    r->latest_sync = HTTP_RING_NO_SYNC;
+    pthread_mutex_unlock(&r->lock);
+    pthread_mutex_destroy(&r->lock);
 }

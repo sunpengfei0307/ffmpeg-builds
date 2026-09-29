@@ -242,7 +242,7 @@ static const AVOption amixrank_options[] = {
     { "rank_interval_ms", "zmq PUB interval for loudness rank.",
             OFFSET(rank_interval_ms), AV_OPT_TYPE_INT, {.i64=100}, 10, 10000, A|F },
     { "rank_endpoint", "zmq PUB endpoint; ignored when task_id/FFMPEG_TASK_ID set "
-                       "(uses ipc:///data/LCMS/sock/gain_<id>.sock).",
+                       "(uses ipc:///data/sock/gain_<id>.sock).",
             OFFSET(rank_endpoint), AV_OPT_TYPE_STRING, {0}, 0, 0, A|F },
     { "task_id", "LCMS task id; prefer ipc gain sock (also from -task_id / FFMPEG_TASK_ID).",
             OFFSET(task_id), AV_OPT_TYPE_INT, {.i64=0}, 0, INT_MAX, A|F },

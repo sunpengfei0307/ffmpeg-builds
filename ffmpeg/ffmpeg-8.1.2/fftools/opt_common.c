@@ -69,7 +69,9 @@ enum show_muxdemuxers {
 };
 
 static FILE *report_file;
-static int report_file_level = AV_LOG_DEBUG;
+/* Same threshold as the console unless FFREPORT level= pins it. Default INFO. */
+static int report_file_level = AV_LOG_INFO;
+static int report_level_explicit;
 
 int show_license(void *optctx, const char *opt, const char *arg)
 {
@@ -1139,9 +1141,12 @@ static void log_callback_report(void *ptr, int level, const char *fmt, va_list v
     av_log_default_callback(ptr, level, fmt, vl);
     av_log_format_line(ptr, level, fmt, vl2, line, sizeof(line), &print_prefix);
     va_end(vl2);
-    if (report_file_level >= level) {
-        fputs(line, report_file);
-        fflush(report_file);
+    {
+        int lim = report_level_explicit ? report_file_level : av_log_get_level();
+        if (lim >= level) {
+            fputs(line, report_file);
+            fflush(report_file);
+        }
     }
 }
 
@@ -1178,6 +1183,7 @@ int init_report(const char *env, FILE **file, const char *prefix)
         } else if (!strcmp(key, "level")) {
             char *tail;
             report_file_level = strtol(val, &tail, 10);
+            report_level_explicit = 1;
             if (*tail) {
                 av_log(NULL, AV_LOG_FATAL, "Invalid report file level\n");
                 av_free(key);
@@ -1217,7 +1223,7 @@ int init_report(const char *env, FILE **file, const char *prefix)
 
     prog_loglevel = av_log_get_level();
     if (!envlevel)
-        report_file_level = FFMAX(report_file_level, prog_loglevel);
+        report_file_level = prog_loglevel;
 
     report_file = fopen_utf8(filename.str, "w");
     if (!report_file) {

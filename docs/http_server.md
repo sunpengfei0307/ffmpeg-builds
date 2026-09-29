@@ -1,6 +1,6 @@
 # 进程内 HTTP 拉流（`-http_server`）
 
-HLS / DASH 仍写盘再 GET。HTTP-FLV / HTTP-TS / HTTP-fMP4 走**内存 GOP**：路径为 `/{app}/{stream}.flv|.ts|.mp4`（默认 `/live/live.flv`），从最近闭合 GOP 的 I 帧起播。
+HLS / DASH 仍写盘再 GET。HTTP-FLV / HTTP-TS / HTTP-fMP4 走**内存 GOP**：路径为 `/{app}/{stream}.flv|.ts|.mp4`（默认 `/live/live.flv`），从最近一个完整同步单元起播。
 
 
 | 模式                 | 路径                                 | 行为                                 |
@@ -29,6 +29,7 @@ HLS / DASH 仍写盘再 GET。HTTP-FLV / HTTP-TS / HTTP-fMP4 走**内存 GOP**�
 
 | 日期         | 说明                                                                                                              |
 | ---------- | --------------------------------------------------------------------------------------------------------------- |
+| 2026-09-24 | 同步 ffmpeg4 `dab424e`：FLV/TS/fMP4 用视频关键帧 DTS 做同一 epoch，按 AVIO marker 切完整同步单元写入 ring。起播从最新完整 sync 单元开始；缓存被挤掉的客户端断开（`cache-stale`），不再跳到更新的 GOP。不再用 AAC priming / `negative_cts_offsets` 对齐 |
 | 2026-09-18 | 从 ffmpeg.4 `262cc35` 回移植：fMP4 `separate_moof+negative_cts_offsets`（不再用 cmaf 单轨）；TS `mpegts_copyts` + AAC priming 音频 PTS 后移；MP4 视频 priming 对齐 AAC delay；IDR 后 flush moof；TS/fMP4 起播一律等 KEY；OpenSSL 1.0.2/1.1 兼容 |
 | 2026-09-14 | FFmpeg 8 `-re`：只按最慢那路限速（对齐上游 `de6bcf5`）。8.1 原先对每路分别 `sleep`，ZLM/MP4 音视频交错差时超前的音频会拖住 demux，视频 `speed` 掉到 0.7x 并刷 `Resumed reading … lag`；4/6 无此 catch-up 逻辑所以不明显。仅 `ffmpeg-8.1.2` |
 | 2026-09-09 | `-http_server` 内存 GOP + `-stream_loop` 切齐 A/V 终点已迁到 `ffmpeg4.4.1.iqiyi`（`write_packet` 旁路推送；4.4 无 `pkt->time_base`/`ch_layout`/`nal.h`，已改用 `ost->st`/`par->channels`/`ff_avc_parse_nal_units_buf`） |
@@ -128,7 +129,7 @@ HLS / DASH 仍写盘再 GET。HTTP-FLV / HTTP-TS / HTTP-fMP4 走**内存 GOP**�
 
 ### 1.4 HTTP-FLV / HTTP-TS / HTTP-fMP4（内存 GOP）
 
-不写磁盘直播文件。默认立刻推**当前最新 1 个 GOP**（building，已从最近 I 起）再跟实时，快起播。`?lowdelay=1` 不推缓存，等下一帧 I 再出。
+不写磁盘直播文件。音视频共用第一个视频关键帧的 DTS 作为 epoch，mux 按 AVIO marker 把完整同步单元推进 ring。默认从**最新一个完整 sync 单元**起播再跟实时。`?lowdelay=1` 不推缓存，等下一个关键帧再出。客户端若落后到该单元已被挤出 ring，连接以 `cache-stale` 断开，不跳到更后面的 GOP。
 
 单路（默认 `/live/live.flv`；自定义流名用 `-http_live_bind`）：
 
@@ -387,7 +388,7 @@ curl -s -X POST "http://127.0.0.1:8091/api/kick?all=1&token=SECRET"
 | `Packet duration: -N / dts: …` + `pts has no value`（copy 拉 `.mp4`，多为音频 stream 1） | copy 的 AAC 包会和上一包 `dts+duration` 重叠，movenc 把 pts 清掉。需带本次写包前校正时间戳的进程 |
 | `Track N starts with a nonzero dts` / `non monotonically increasing dts`（连上 `.mp4` 时） | 旧进程 `empty_moov` 后首包 dts 不是 0；懒 mux 把 GOP 里当前包写了两遍。需带 `delay_moov` + enable 后不再重复写的进程 |
 | copy 比转码更容易花屏 / 卡顿 / 音画不同步（`-c:v copy -c:a aac`） | 不是纯 copy：视频保留源 dts/GOP，音频解码再编码。RTMP 请加 `-f live_flv`（`AVFMT_TS_DISCONT`），否则跳跃 dts 会被丢掉。FLV 的 KEY 可能是非 IDR 的 I 帧，GOP 从这里切会起播花屏。稳妥做法：两边都转码，或 `-c copy` 且音频也不重编。8.x 无 `-async` |
-| `-stream_loop` / 文件读到尾再循环，时间长了音画漂 | 旧进程用 `max_pts-min_pts` 跨 timebase 累加，两轨长度不同则接点空洞/重叠。现进程按 `min(音视频 pts+dur)` 切掉长轨尾巴，`duration` 用 `AV_TIME_BASE`。无容器 duration 时第一圈接点仍可能不齐。copy+音频重编、HTTP `live_sanitize_ts` 单边推音频仍可能漂 |
+| `-stream_loop` / 文件读到尾再循环，时间长了音画漂 | 旧进程用 `max_pts-min_pts` 跨 timebase 累加，两轨长度不同则接点空洞/重叠。现进程按 `min(音视频 pts+dur)` 切掉长轨尾巴，`duration` 用 `AV_TIME_BASE`。无容器 duration 时第一圈接点仍可能不齐。HTTP-FLV/TS/fMP4 用同一视频关键帧 DTS 做 epoch，不再按轨单独平移 |
 | FFmpeg 8 `-re -c copy` 推 RTMP/`-f null` 刷 `Resumed reading at pts … rate 1.050 after a lag`，`speed` 不足、中途卡顿；4/6 正常 | 8.1 对每路 DTS 分别 sleep，交错差的 MP4 上超前轨拖住落后轨，lag 只增不减。需带本次「只按最慢路限速」的 8.1.2。4.4/6.1 没有 catch-up 时钟。若仍偶发 lag（出口阻塞）再加 `-readrate_catchup 10` |
 | copy 比转码更容易花屏 / `.ts` 首次或切换格式像没缓存、出流慢 | copy 是 AVCC，转码是 Annex B。旧进程把 AVCC 原样打进 TS（缺起始码和 SPS/PPS），且 TS 干等下一个 I。需带本次按 NALU 头转换 + `h264_mp4toannexb` + TS 从 GOP 缓存起播的进程 |
 | `Invalid NAL unit 0` / `no frame` / `log2_max_frame_num_minus4=31` / `missing picture`（`.mp4`/`.flv` 花屏，`.ts` 稍好） | GOP 缓存的是编码器包；播放器读的是 mux 后的 ring。TS 能靠 `0x47` 再同步。旧进程把 P 帧 fMP4 盒子标成关键帧、或从 oldest 半包起播、或 Annex B 当 AVCC 写入。需带本次 fragment 延后标 key + 无 IDR 则等待 + acc 回写的进程 |

@@ -2530,7 +2530,20 @@ int sch_filter_receive(Scheduler *sch, unsigned fg_idx,
     }
 
     if (*in_idx == fg->nb_inputs) {
-        int terminate = waiter_wait(sch, &fg->waiter);
+        int idx = -1, ret, terminate;
+
+        /* Source-driven graphs (合屏: no external demux input) never block in
+         * tq_receive, so a command on the control stream would sit unread and
+         * the process -zmq REP would hang. Take one queued frame first. */
+        ret = tq_receive_try(fg->queue, &idx, frame);
+        if (ret >= 0) {
+            *in_idx = idx;
+            return 0;
+        }
+        if (ret == AVERROR_EOF && idx < 0)
+            return AVERROR_EOF;
+
+        terminate = waiter_wait(sch, &fg->waiter);
         return terminate ? AVERROR_EOF : AVERROR(EAGAIN);
     }
 

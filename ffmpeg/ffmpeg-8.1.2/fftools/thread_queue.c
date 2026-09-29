@@ -194,7 +194,7 @@ static int receive_locked(ThreadQueue *tq, int *stream_idx,
     return nb_finished == tq->nb_streams ? AVERROR_EOF : AVERROR(EAGAIN);
 }
 
-int tq_receive(ThreadQueue *tq, int *stream_idx, void *data)
+static int receive_once(ThreadQueue *tq, int *stream_idx, void *data, int block)
 {
     int ret;
 
@@ -211,7 +211,7 @@ int tq_receive(ThreadQueue *tq, int *stream_idx, void *data)
         if (can_read != av_container_fifo_can_read(tq->fifo))
             pthread_cond_broadcast(&tq->cond);
 
-        if (ret == AVERROR(EAGAIN)) {
+        if (ret == AVERROR(EAGAIN) && block) {
             pthread_cond_wait(&tq->cond, &tq->lock);
             continue;
         }
@@ -222,6 +222,16 @@ int tq_receive(ThreadQueue *tq, int *stream_idx, void *data)
     pthread_mutex_unlock(&tq->lock);
 
     return ret;
+}
+
+int tq_receive(ThreadQueue *tq, int *stream_idx, void *data)
+{
+    return receive_once(tq, stream_idx, data, 1);
+}
+
+int tq_receive_try(ThreadQueue *tq, int *stream_idx, void *data)
+{
+    return receive_once(tq, stream_idx, data, 0);
 }
 
 void tq_send_finish(ThreadQueue *tq, unsigned int stream_idx)

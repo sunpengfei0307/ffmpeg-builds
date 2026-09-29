@@ -6,6 +6,7 @@
 
 | 日期 | 说明 |
 |------|------|
+| 2026-09-22 | 输入 pad 可用 `[asil][a0-a15]`（图解析层展开） |
 | 2026-08-06 | 补充 `search` 回复字段说明：`槽:enabled:weight` |
 | 2026-08-06 | `search` 支持单槽/区间：`search` / `search 1` / `search 1-4` |
 | 2026-08-06 | zmq/命令：入口 WARNING 打印；失败 ERROR 详报 |
@@ -74,7 +75,7 @@
 
 ```text
 anullsrc=channel_layout=stereo:sample_rate=48000[asil];
-[asil][a0][a1][a2][a3]amixrank=inputs=5:normalize=0:ducking=1:duck_gain_db=-18:rank_interval_ms=100:weights=0|1|1|1|1:buffer_ms=200[aout]
+[asil][a0-a3]amixrank=inputs=5:normalize=0:ducking=1:duck_gain_db=-18:rank_interval_ms=100:weights=0|1|1|1|1:buffer_ms=200[aout]
 ```
 
 ## 运行时命令（图内 zmq）
@@ -113,6 +114,7 @@ anullsrc=channel_layout=stereo:sample_rate=48000[asil];
 ## 注意事项
 
 - `inputs` / `weights` 必须与实际音频 pad 对齐
+- 16 路预留写 `[asil][a0-a15]amixrank=inputs=17:...`，不必逐个列 `[a0]…[a15]`
 - 完整合屏模板见 [mixing_cuda.md](./mixing_cuda.md) §3
 
 ## 踩坑记录

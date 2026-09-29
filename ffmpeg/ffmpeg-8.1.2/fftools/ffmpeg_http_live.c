@@ -8,6 +8,7 @@
 #include "ffmpeg.h"
 #include "ffmpeg_http_ev.h"
 #include "ffmpeg_http_ring.h"
+#include "ffmpeg_http_mux.h"
 
 #include <errno.h>
 #include <inttypes.h>
@@ -82,8 +83,6 @@ struct HttpLivePub {
     AVRational vtb;
     AVRational atb;
     AVRational vfr;
-    int a_pad;
-    int a_rate;
     LiveList ready;
     LiveList building;
     LiveSub *subs;
@@ -95,20 +94,23 @@ struct HttpLivePub {
         AVFormatContext *oc;
         AVIOContext *pb;
         unsigned char *iobuf;
-        uint8_t *acc;
-        int acc_len, acc_sz, acc_pos;
-        int64_t file_pos;
         HttpLiveBuf *header;
         HttpPtrRing ring;
+        HttpMuxOutput output;
         int v_out, a_out;
         int to_avcc, to_asc;
-        int frag_key;
-        int64_t ts_off;
-        int have_off;
-        int64_t last_dts[2];
-        int64_t last_dur[2];
-        int64_t v_priming;
-        int64_t a_priming;
+        int64_t epoch_us;
+        int have_epoch;
+        int failed;
+        /* Set when a stream (typically late audio) appeared after this format
+         * was built without it: rebuild at the next video key so the new
+         * output stream joins instead of being silently dropped. */
+        int want_rebuild;
+        /* Monotonic epoch of this format's mux/ring content. Bumped once each
+         * time a running format is retired (fail / late-audio / rebuild) so
+         * live clients bound to the old epoch drop immediately instead of ever
+         * reading a rebuilt ring. Initialized once; never reset by free. */
+        atomic_uint_fast64_t generation;
         AVBSFContext *vbsf;
         const char *name;
     } fmux[LIVE_FMT_NB];
@@ -266,17 +268,6 @@ static int live_ensure_par(HttpLivePub *pub, const OutputStream *ost,
             pub->vfr = ost->enc->enc_ctx->framerate;
         else
             pub->vfr = (AVRational){ 25, 1 };
-    } else {
-        if (ost->enc && ost->enc->enc_ctx) {
-            if (ost->enc->enc_ctx->initial_padding > 0)
-                pub->a_pad = ost->enc->enc_ctx->initial_padding;
-            if (ost->enc->enc_ctx->sample_rate > 0)
-                pub->a_rate = ost->enc->enc_ctx->sample_rate;
-        }
-        if (!pub->a_rate && ost->st && ost->st->codecpar)
-            pub->a_rate = ost->st->codecpar->sample_rate;
-        if (!pub->a_pad && ost->st && ost->st->codecpar)
-            pub->a_pad = ost->st->codecpar->initial_padding;
     }
     if (!is_video && ost->st && ost->st->codecpar &&
         !(*dst)->extradata_size && ost->st->codecpar->extradata_size > 0) {
@@ -923,8 +914,10 @@ static int live_subscribe(HttpLivePub *pub, LiveSub *sub, int lowdelay)
     return 0;
 }
 
-static int live_write_pkt(struct LiveFmtMux *m, AVPacket *pkt,
-                          AVRational src_tb, int out_st, int to_asc);
+static int live_mux_write_packet(struct LiveFmtMux *m, const AVPacket *pkt,
+                                 AVRational src_tb, int out_st);
+static void live_mux_fail(HttpLivePub *pub, int fi, int err);
+static void live_mux_invalidate(HttpLivePub *pub, int fi);
 
 static int live_fmt_idx(const char *fmt)
 {
@@ -1191,189 +1184,43 @@ static void live_fmt_dur(char *out, int sz, int64_t sec)
         snprintf(out, sz, "%ds", s);
 }
 
-static struct LiveFmtMux *live_mux_from_key(void *opaque)
+/* First video key packet with a usable DTS in the GOP that replay will start
+ * from. This packet's DTS defines the single common epoch for audio+video. */
+static const AVPacket *live_first_gop_video_key_dts(const HttpLivePub *pub)
 {
-    intptr_t key = (intptr_t)opaque;
-    int pidx = (int)(key >> 8), fi = (int)(key & 0xff);
+    const LiveNode *n;
+    const LiveList *g;
 
-    if (pidx < 0 || pidx >= nb_pubs || fi < 0 || fi >= LIVE_FMT_NB)
+    if (!pub)
         return NULL;
-    return &pubs[pidx].fmux[fi];
-}
-
-/* Write/seek into the unflushed acc window so FLV tag / moof size patches
- * still work after the 256KB AVIO buffer has spilled. */
-static int live_mux_avio(void *opaque, const uint8_t *buf, int buf_size)
-{
-    struct LiveFmtMux *m = live_mux_from_key(opaque);
-    uint8_t *nbuf;
-    int need;
-
-    if (!m || buf_size < 0)
-        return AVERROR(EINVAL);
-    if (!buf_size)
-        return 0;
-    need = m->acc_pos + buf_size;
-    if (need > m->acc_sz) {
-        int nsz = FFMAX(need, m->acc_sz * 2 + 4096);
-        nbuf = av_realloc(m->acc, nsz);
-        if (!nbuf)
-            return AVERROR(ENOMEM);
-        m->acc = nbuf;
-        m->acc_sz = nsz;
+    g = pub->building.has_key ? &pub->building :
+        (pub->ready.head ? &pub->ready : NULL);
+    if (!g)
+        return NULL;
+    for (n = g->head; n; n = n->next) {
+        if (n->st == 0 && n->pkt && n->pkt->size > 0 &&
+            (n->pkt->flags & AV_PKT_FLAG_KEY) &&
+            n->pkt->dts != AV_NOPTS_VALUE)
+            return n->pkt;
     }
-    memcpy(m->acc + m->acc_pos, buf, buf_size);
-    m->acc_pos += buf_size;
-    if (m->acc_pos > m->acc_len)
-        m->acc_len = m->acc_pos;
-    return buf_size;
+    return NULL;
 }
 
-static int64_t live_mux_avio_seek(void *opaque, int64_t offset, int whence)
-{
-    struct LiveFmtMux *m = live_mux_from_key(opaque);
-    int64_t target, local;
-
-    if (!m)
-        return AVERROR(EINVAL);
-    if (whence == AVSEEK_SIZE)
-        return m->file_pos + m->acc_len;
-    if (whence == SEEK_CUR)
-        offset += m->file_pos + m->acc_pos;
-    else if (whence == SEEK_END)
-        offset += m->file_pos + m->acc_len;
-    else if (whence != SEEK_SET)
-        return AVERROR(EINVAL);
-    target = offset;
-    local = target - m->file_pos;
-    if (local < 0 || local > m->acc_len)
-        return AVERROR(EINVAL);
-    m->acc_pos = (int)local;
-    return target;
-}
-
-static void live_mux_flush_acc(HttpLivePub *pub, int fi, int is_key)
-{
-    struct LiveFmtMux *m = &pub->fmux[fi];
-    HttpLiveBuf *b;
-    unsigned pos;
-
-    if (!m->acc_len)
-        return;
-    b = http_livebuf_alloc(m->acc, m->acc_len, is_key);
-    m->file_pos += m->acc_len;
-    m->acc_len = 0;
-    m->acc_pos = 0;
-    if (!b)
-        return;
-    pos = http_ring_wpos(&m->ring);
-    http_ring_push(&m->ring, b);
-    if (is_key)
-        http_ring_mark_gop(&m->ring, pos);
-    http_livebuf_unref(&b);
-    live_notify_workers(pub, HTTP_EV_MSG_FRAME, fi);
-}
-
-/* Pull ftyp(+moov) off acc before the first moof so every client gets init
- * even with delay_moov (moov is written on the first fragment, not write_header). */
-static void live_mux_take_mp4_header(struct LiveFmtMux *m)
-{
-    int pos = 0, saw_moov = 0, end;
-
-    if (!m || m->header || m->acc_len < 8)
-        return;
-    while (pos + 8 <= m->acc_len) {
-        uint32_t sz = AV_RB32(m->acc + pos);
-        if (sz < 8 || pos + (int)sz > m->acc_len)
-            return;
-        if (!memcmp(m->acc + pos + 4, "moof", 4) ||
-            !memcmp(m->acc + pos + 4, "mdat", 4)) {
-            if (!saw_moov)
-                return;
-            break;
-        }
-        if (!memcmp(m->acc + pos + 4, "moov", 4))
-            saw_moov = 1;
-        pos += sz;
-    }
-    end = pos;
-    if (!saw_moov || end <= 0)
-        return;
-    m->header = http_livebuf_alloc(m->acc, end, 1);
-    if (end < m->acc_len)
-        memmove(m->acc, m->acc + end, m->acc_len - end);
-    m->acc_len -= end;
-    m->acc_pos = m->acc_len;
-    m->file_pos += end;
-}
-
-/* fMP4 frag_every_frame writes the *previous* sample's moof+mdat during
- * av_write_frame(current). Mark the ring slot with that previous sample. */
-static void live_mux_commit(HttpLivePub *pub, int fi, int is_key)
-{
-    struct LiveFmtMux *m = &pub->fmux[fi];
-    int slot_key = is_key;
-
-    if (fi == LIVE_FMT_MP4)
-        live_mux_take_mp4_header(m);
-    if (fi == LIVE_FMT_MP4) {
-        if (!m->acc_len) {
-            /* Sample still in movenc; keep the delayed key across audio
-             * packets that produce no bytes. */
-            m->frag_key = m->frag_key || is_key;
-            return;
-        }
-        slot_key = m->frag_key;
-        m->frag_key = is_key;
-    }
-    live_mux_flush_acc(pub, fi, slot_key);
-}
-
-static void live_mux_flush_mp4(HttpLivePub *pub, int fi)
-{
-    struct LiveFmtMux *m = &pub->fmux[fi];
-
-    if (fi != LIVE_FMT_MP4 || !m->oc)
-        return;
-    av_write_frame(m->oc, NULL);
-    if (m->oc->pb)
-        avio_flush(m->oc->pb);
-    live_mux_commit(pub, fi, 0);
-}
-
-/* fMP4 keeps the current sample until the next write. Flush after an IDR so
- * clients start on this GOP instead of replaying the previous one (fast-forward).
- * Wait until audio has been muxed so delay_moov does not emit a video-only moov. */
-static void live_mux_emit(HttpLivePub *pub, int fi, int is_key)
-{
-    struct LiveFmtMux *m = &pub->fmux[fi];
-
-    live_mux_commit(pub, fi, is_key);
-    if (fi != LIVE_FMT_MP4 || !is_key || !m->oc)
-        return;
-    if (m->a_out >= 0 && m->last_dts[m->a_out] == AV_NOPTS_VALUE)
-        return;
-    live_mux_flush_mp4(pub, fi);
-}
-
+/* Reset the marker-driven output assembler and its shared ring, keeping the
+ * ring allocation so a rebuilt muxer can reuse it. */
 static void live_mux_free(struct LiveFmtMux *m)
 {
     if (!m)
         return;
+    http_mux_output_destroy(&m->output);
     http_ring_clear(&m->ring);
     http_livebuf_unref(&m->header);
     av_bsf_free(&m->vbsf);
-    av_freep(&m->acc);
-    m->acc_len = m->acc_sz = m->acc_pos = 0;
-    m->file_pos = 0;
-    m->frag_key = 0;
     m->to_avcc = m->to_asc = 0;
-    m->have_off = 0;
-    m->ts_off = AV_NOPTS_VALUE;
-    m->last_dts[0] = m->last_dts[1] = AV_NOPTS_VALUE;
-    m->last_dur[0] = m->last_dur[1] = 0;
-    m->v_priming = 0;
-    m->a_priming = 0;
+    m->epoch_us = 0;
+    m->have_epoch = 0;
+    m->failed = 0;
+    m->want_rebuild = 0;
     m->v_out = m->a_out = -1;
     if (m->oc) {
         if (m->oc->pb) {
@@ -1387,31 +1234,95 @@ static void live_mux_free(struct LiveFmtMux *m)
     }
 }
 
+/* Open a new MPEG-TS media unit: the next bytes written (PAT/PMT + video key
+ * of the upcoming GOP) become a joinable sync unit in the shared ring. */
+static void live_ts_open_sync(struct LiveFmtMux *m, int64_t key_time)
+{
+    if (m && m->pb)
+        avio_write_marker(m->pb, key_time, AVIO_DATA_MARKER_SYNC_POINT);
+}
+
+/* MPEG-TS produces no per-packet AVIO sync/boundary markers, so segment the
+ * shared ring at video keyframe GOP boundaries: drain the standard interleaver
+ * exactly once to finish the previous complete GOP (no truncated PES, no
+ * per-packet flush), publish it as one key/sync unit, then open the next unit.
+ * Output-block properties come from the interleaver + marker, never from
+ * guessing the current input packet's shape. */
+static int live_ts_gop_boundary(struct LiveFmtMux *m, int64_t key_time)
+{
+    int ret;
+
+    if (!m || !m->oc || !m->pb)
+        return 0;
+    ret = av_interleaved_write_frame(m->oc, NULL);
+    if (ret < 0)
+        return ret;
+    avio_flush(m->pb);
+    ret = http_mux_output_finish(&m->output, 1);
+    if (ret < 0)
+        return ret;
+    live_ts_open_sync(m, key_time);
+    return 0;
+}
+
+/* Retire the current generation of a running format exactly once. Bumping the
+ * generation and waking this format's live workers makes clients bound to the
+ * old epoch disconnect with reason "mux-restart" before they can read a rebuilt
+ * ring. Callers gate this on m->failed / m->want_rebuild so a burst of packets
+ * never bumps the generation more than once per retirement. Must hold
+ * live_mutex (the single mux writer path). */
+static void live_mux_invalidate(HttpLivePub *pub, int fi)
+{
+    struct LiveFmtMux *m = &pub->fmux[fi];
+
+    atomic_fetch_add(&m->generation, 1);
+    /* Wake only the workers currently viewing this format so they re-check the
+     * generation and drop; other formats and idle workers are untouched. */
+    live_notify_workers(pub, HTTP_EV_MSG_FRAME, fi);
+}
+
+/* Admission predicate for a new client binding to a running format (evaluated
+ * under live_mutex): a client may bind the current header/generation only when
+ * the format is on AND has no pending retirement. While failed or want_rebuild
+ * is set, the generation was already bumped and the header/ring belong to the
+ * outgoing epoch, so a new client must not bind them — it is refused and
+ * reconnects onto the rebuilt generation. Kept in sync with the serve-side
+ * unit test serve_admit(). */
+static int live_mux_admit(int mux_on, int failed, int want_rebuild)
+{
+    return mux_on && !failed && !want_rebuild;
+}
+
 static int live_mux_enable(HttpLivePub *pub, int fi)
 {
     struct LiveFmtMux *m;
     const char *fmt;
     AVDictionary *opts = NULL;
-    intptr_t key;
+    const AVPacket *epoch_key;
+    uint64_t before;
     int ret;
     LiveNode *n;
 
     if (atomic_load(&pub->mux_on[fi]))
         return 0;
+    if (!pub->vpar)
+        return AVERROR(EAGAIN);
+    /* The common epoch needs a video key packet carrying a valid DTS. Reject
+     * the enable until the replay GOP can supply one. */
+    epoch_key = live_first_gop_video_key_dts(pub);
+    if (!epoch_key)
+        return AVERROR(EAGAIN);
     m = &pub->fmux[fi];
     live_mux_free(m);
     fmt = fi == LIVE_FMT_FLV ? "flv" : fi == LIVE_FMT_TS ? "mpegts" : "mp4";
     m->name = fmt;
     m->v_out = m->a_out = -1;
-    m->ts_off = AV_NOPTS_VALUE;
-    m->have_off = 0;
-    m->frag_key = 0;
-    m->file_pos = 0;
-    m->last_dts[0] = m->last_dts[1] = AV_NOPTS_VALUE;
-    m->last_dur[0] = m->last_dur[1] = 0;
-    m->v_priming = 0;
-    m->a_priming = 0;
-    http_ring_init(&m->ring);
+    m->epoch_us = av_rescale_q(epoch_key->dts, pub->vtb, AV_TIME_BASE_Q);
+    m->have_epoch = 1;
+    m->failed = 0;
+    m->want_rebuild = 0;
+    http_ring_clear(&m->ring);
+    http_mux_output_init(&m->output, &m->ring);
     ret = avformat_alloc_output_context2(&m->oc, NULL, fmt, NULL);
     if (ret < 0 || !m->oc) {
         live_mux_free(m);
@@ -1441,10 +1352,6 @@ static int live_mux_enable(HttpLivePub *pub, int fi)
             st->r_frame_rate = pub->vfr;
         }
         m->v_out = st->index;
-        if (fi == LIVE_FMT_MP4 && pub->a_pad > 0 && pub->a_rate > 0)
-            m->v_priming = av_rescale_q(pub->a_pad,
-                                        (AVRational){ 1, pub->a_rate },
-                                        st->time_base);
         avcodec_parameters_free(&vp);
     }
     if (pub->apar) {
@@ -1478,17 +1385,17 @@ static int live_mux_enable(HttpLivePub *pub, int fi)
         live_mux_free(m);
         return AVERROR(ENOMEM);
     }
-    key = ((intptr_t)(pub - pubs) << 8) | fi;
-    m->pb = avio_alloc_context(m->iobuf, LIVE_AVIO_BUF, 1, (void *)key,
-                               NULL, live_mux_avio, live_mux_avio_seek);
+    /* The muxer streams straight into the marker-driven assembler; there is no
+     * seek-back, so header/init and sync units are cut by AVIO data markers. */
+    m->pb = avio_alloc_context(m->iobuf, LIVE_AVIO_BUF, 1, &m->output,
+                               NULL, NULL, NULL);
     if (!m->pb) {
         av_freep(&m->iobuf);
         live_mux_free(m);
         return AVERROR(ENOMEM);
     }
-    /* Keep seekable=0 so muxers do not rewrite already-pushed headers.
-     * live_mux_avio_seek still patches sizes inside the current acc window. */
     m->pb->seekable = 0;
+    m->pb->write_data_type = http_mux_write_data_type;
     m->oc->pb = m->pb;
     if (fi != LIVE_FMT_MP4)
         m->oc->flags |= AVFMT_FLAG_FLUSH_PACKETS;
@@ -1496,20 +1403,31 @@ static int live_mux_enable(HttpLivePub *pub, int fi)
     if (fi == LIVE_FMT_FLV)
         av_dict_set(&opts, "flvflags", "no_duration_filesize", 0);
     if (fi == LIVE_FMT_TS) {
-        /* copyts: keep the same A/V clock as FLV. Default mpegts delay
-         * plus starting mid-GOP makes video look ~1s behind audio. */
+        /* resend_headers + pat_pmt_at_frames: every GOP unit re-emits PAT/PMT
+         * so a client can join on any complete-GOP sync unit.
+         * copyts: keep the same A/V clock as FLV; let the standard interleaver
+         * and the muxer form complete PES with direct 90 kHz rescaling. GOP
+         * segmentation is done by draining once at each video key boundary
+         * (see live_ts_gop_boundary), not by per-packet flushing. */
         av_dict_set(&opts, "mpegts_flags", "resend_headers+pat_pmt_at_frames", 0);
         av_dict_set(&opts, "mpegts_copyts", "1", 0);
     }
     if (fi == LIVE_FMT_MP4)
-        /* delay_moov: first sample dts need not be 0.
-         * frag_every_frame: GOP-sized moof stalls players every -g.
-         * separate_moof + negative_cts_offsets: HEVC+AAC+B-frames in one
-         * file; cmaf (single-track chunks) leaves video on the first
-         * sample while audio keeps moving. */
+        /* Standard fragmented MP4:
+         *  empty_moov        -> ftyp+moov is a complete, immutable init
+         *                       segment emitted by write_header.
+         *  default_base_moof -> self-contained moof addressing.
+         *  frag_keyframe     -> one multi-track moof+mdat fragment per video
+         *                       GOP, so every media unit starts on a key.
+         * Composition time stays a non-negative trun offset (pts-dts), the
+         * same model as FLV compositionTime. negative_cts_offsets is omitted:
+         * it adds the first video sample's pts-dts (B-frame reorder, often
+         * ~200 ms) to every video DTS and stores a negative CTS, while audio
+         * is unshifted. Players that clamp or ignore signed CTS then show
+         * the picture late by that delay. FLV and TS present the original PTS.
+         * Init and sync boundaries come only from AVIO data markers. */
         av_dict_set(&opts, "movflags",
-                    "frag_every_frame+delay_moov+empty_moov+default_base_moof+"
-                    "separate_moof+negative_cts_offsets", 0);
+                    "empty_moov+default_base_moof+frag_keyframe", 0);
     av_dict_set(&opts, "flush_packets", "1", 0);
     ret = avformat_write_header(m->oc, &opts);
     av_dict_free(&opts);
@@ -1517,46 +1435,39 @@ static int live_mux_enable(HttpLivePub *pub, int fi)
         live_mux_free(m);
         return ret;
     }
-    /* mpegts forces 90 kHz after write_header. ADTS players skip AAC
-     * priming (FLV does too; fMP4 does not), so audio leads video by
-     * ~40–80ms. Delay audio PTS only on TS. */
-    if (fi == LIVE_FMT_TS && m->a_out >= 0 && pub->a_pad > 0 && pub->a_rate > 0) {
-        AVStream *ast = m->oc->streams[m->a_out];
-        m->a_priming = av_rescale_q(pub->a_pad,
-                                    (AVRational){ 1, pub->a_rate },
-                                    ast->time_base);
-    }
     avio_flush(m->oc->pb);
-    if (fi == LIVE_FMT_MP4)
-        live_mux_take_mp4_header(m);
-    else if (m->acc_len) {
-        m->header = http_livebuf_alloc(m->acc, m->acc_len, 1);
-        m->file_pos += m->acc_len;
-        m->acc_len = 0;
-        m->acc_pos = 0;
+    /* Isolate the format header / init segment produced by write_header. */
+    ret = http_mux_output_finish_header(&m->output, &m->header);
+    if (ret < 0) {
+        live_mux_free(m);
+        return ret;
     }
+    /* Replay the current GOP through the standard interleaver. Each packet is
+     * epoch-shifted and rescaled once; libavformat orders the streams and the
+     * AVIO markers cut complete sync units into the ring. */
     n = pub->building.has_key ? pub->building.head :
         (pub->ready.head ? pub->ready.head : NULL);
+    /* MPEG-TS: open the first GOP's sync unit before replay so the replayed
+     * key + its PAT/PMT begin a joinable unit (FLV/MP4 self-mark via markers).
+     * This tail GOP is only published once the next key completes it. */
+    if (fi == LIVE_FMT_TS)
+        live_ts_open_sync(m, m->epoch_us);
+    before = http_ring_wpos(&m->ring);
     for (; n; n = n->next) {
         AVRational tb = n->st == 0 ? pub->vtb : pub->atb;
         int out = n->st == 0 ? m->v_out : m->a_out;
-        int pkt_key = n->st == 0 && n->pkt && (n->pkt->flags & AV_PKT_FLAG_KEY);
-        if (!m->have_off && n->pkt && n->pkt->dts != AV_NOPTS_VALUE) {
-            m->ts_off = av_rescale_q(n->pkt->dts, tb, AV_TIME_BASE_Q);
-            m->have_off = 1;
+
+        ret = live_mux_write_packet(m, n->pkt, tb, out);
+        if (ret < 0) {
+            /* A broken replay must not publish a partial sync unit. */
+            http_mux_output_finish(&m->output, 0);
+            live_mux_free(m);
+            return ret;
         }
-        if (live_write_pkt(m, n->pkt, tb, out, n->st == 1 ? m->to_asc : 0) < 0)
-            ffmpeg_http_log(AV_LOG_WARNING,
-                            "http-live: mux %s replay st=%d failed\n",
-                            m->name, n->st);
-        live_mux_emit(pub, fi, pkt_key);
-    }
-    if (fi == LIVE_FMT_MP4) {
-        live_mux_flush_mp4(pub, fi);
-        live_mux_take_mp4_header(m);
     }
     atomic_store(&pub->mux_on[fi], 1);
-    live_notify_workers(pub, HTTP_EV_MSG_FRAME, fi);
+    if (http_ring_wpos(&m->ring) != before)
+        live_notify_workers(pub, HTTP_EV_MSG_FRAME, fi);
     return 0;
 }
 
@@ -1568,153 +1479,126 @@ static void live_mux_packet(HttpLivePub *pub, const AVPacket *pkt, int st)
 
     for (fi = 0; fi < LIVE_FMT_NB; fi++) {
         struct LiveFmtMux *m = &pub->fmux[fi];
-        int out, was_on;
+        uint64_t before;
+        int out, was_on, ret;
+
         was_on = atomic_load(&pub->mux_on[fi]);
+
+        /* A failed format, or one that must pick up a stream that appeared
+         * after it was built (e.g. late audio), stops publishing and rebuilds
+         * at the next video key from the current GOP (which starts at it). */
+        if (was_on && (m->failed || m->want_rebuild)) {
+            if (!is_key)
+                continue;
+            atomic_store(&pub->mux_on[fi], 0);
+            live_mux_enable(pub, fi);
+            continue;
+        }
+
         if (!was_on && atomic_load(&pub->fmt_want[fi]) > 0)
             live_mux_enable(pub, fi);
         if (!atomic_load(&pub->mux_on[fi]) || !m->oc)
             continue;
-        /* enable() already muxed the current packet as part of GOP replay. */
+        /* enable() already muxed the current GOP, including this packet. */
         if (!was_on)
             continue;
+
         out = st == 0 ? m->v_out : m->a_out;
-        if (!m->have_off && pkt && pkt->dts != AV_NOPTS_VALUE) {
-            m->ts_off = av_rescale_q(pkt->dts, tb, AV_TIME_BASE_Q);
-            m->have_off = 1;
+
+        /* Audio appeared after this format was built video-only: retire this
+         * generation now (so existing clients drop immediately rather than
+         * waiting for the rebuild) and schedule a rebuild at the next video key
+         * so a_out joins the mux. This first audio packet is dropped because
+         * there is no output stream for it yet; it will be included from the
+         * next key when the format is rebuilt. Never silently drop audio
+         * forever. Runs the invalidate once, on the 0->1 transition. */
+        if (st == 1 && pub->apar && m->a_out < 0) {
+            if (!m->want_rebuild) {
+                m->want_rebuild = 1;
+                live_mux_invalidate(pub, fi);
+                ffmpeg_http_log(AV_LOG_WARNING,
+                        "http-live: mux %s audio appeared late, dropping until "
+                        "next-key rebuild\n", m->name ? m->name : "?");
+            }
+            continue;
         }
-        if (live_write_pkt(m, (AVPacket *)pkt, tb, out, st == 1 ? m->to_asc : 0) < 0)
-            ffmpeg_http_log(AV_LOG_WARNING,
-                            "http-live: mux %s st=%d write failed\n",
-                            m->name, st);
-        live_mux_emit(pub, fi, is_key);
-    }
-}
 
-static int64_t live_default_dur(const AVStream *st)
-{
-    const AVCodecParameters *par;
-    AVRational fr;
+        before = http_ring_wpos(&m->ring);
 
-    if (!st || !st->codecpar)
-        return 0;
-    par = st->codecpar;
-    if (par->codec_type == AVMEDIA_TYPE_AUDIO && par->sample_rate > 0) {
-        int nb = par->frame_size > 0 ? par->frame_size : 1024;
-        return av_rescale_q(nb, (AVRational){ 1, par->sample_rate }, st->time_base);
-    }
-    if (par->codec_type == AVMEDIA_TYPE_VIDEO) {
-        fr = st->avg_frame_rate.num ? st->avg_frame_rate : st->r_frame_rate;
-        if (fr.num && fr.den)
-            return av_rescale_q(1, av_inv_q(fr), st->time_base);
-    }
-    return 0;
-}
-
-/* copy 音频常和上一包 dts+duration 重叠（AAC priming / 时间基取整），movenc
- * 会报 Packet duration 为负并把 pts 清掉。缺 pts 时用 dts。重叠则后移，保持 cts。 */
-static void live_sanitize_ts(struct LiveFmtMux *m, AVPacket *out, AVStream *st,
-                             int out_st)
-{
-    int64_t def, min_dts, shift;
-
-    if (out->dts == AV_NOPTS_VALUE && out->pts != AV_NOPTS_VALUE)
-        out->dts = out->pts;
-    if (out->pts == AV_NOPTS_VALUE && out->dts != AV_NOPTS_VALUE)
-        out->pts = out->dts;
-
-    def = live_default_dur(st);
-    if (out->duration < 0)
-        out->duration = 0;
-    if (out->duration <= 0 && def > 0)
-        out->duration = def;
-
-    if (out_st < 0 || out_st > 1)
-        return;
-
-    if (out->dts == AV_NOPTS_VALUE) {
-        if (m->last_dts[out_st] != AV_NOPTS_VALUE)
-            out->dts = m->last_dts[out_st] +
-                       (m->last_dur[out_st] > 0 ? m->last_dur[out_st] : 1);
-        else
-            out->dts = 0;
-        out->pts = out->dts;
-    }
-
-    if (out->dts < 0) {
-        shift = -out->dts;
-        out->dts = 0;
-        if (out->pts != AV_NOPTS_VALUE)
-            out->pts += shift;
-    }
-
-    if (m->last_dts[out_st] != AV_NOPTS_VALUE) {
-        min_dts = m->last_dts[out_st];
-        if (m->last_dur[out_st] > 0)
-            min_dts += m->last_dur[out_st];
-        else
-            min_dts += 1;
-        if (out->dts < min_dts) {
-            shift = min_dts - out->dts;
-            out->dts = min_dts;
-            if (out->pts != AV_NOPTS_VALUE)
-                out->pts += shift;
-            else
-                out->pts = out->dts;
+        /* MPEG-TS carries no muxer sync markers: at a video key GOP boundary
+         * drain + publish the previous complete GOP, then open the next sync
+         * unit before writing this key. FLV/MP4 self-mark via AVIO markers.
+         * key_time is only an informational marker timestamp; when the key lacks
+         * a usable DTS (or the time base is degenerate) pass AV_NOPTS_VALUE
+         * rather than performing an invalid rescale. */
+        if (fi == LIVE_FMT_TS && is_key) {
+            int64_t key_time = (pkt && pkt->dts != AV_NOPTS_VALUE &&
+                                tb.num && tb.den)
+                ? av_rescale_q(pkt->dts, tb, AV_TIME_BASE_Q)
+                : AV_NOPTS_VALUE;
+            ret = live_ts_gop_boundary(m, key_time);
+            if (ret < 0) {
+                live_mux_fail(pub, fi, ret);
+                continue;
+            }
         }
+
+        ret = live_mux_write_packet(m, pkt, tb, out);
+        if (ret < 0) {
+            live_mux_fail(pub, fi, ret);
+            continue;
+        }
+        /* Notify only once a complete sync unit has been published. */
+        if (http_ring_wpos(&m->ring) != before)
+            live_notify_workers(pub, HTTP_EV_MSG_FRAME, fi);
     }
-    if (out->pts == AV_NOPTS_VALUE)
-        out->pts = out->dts;
-    m->last_dts[out_st] = out->dts;
-    m->last_dur[out_st] = out->duration > 0 ? out->duration : def;
 }
 
-static int live_write_pkt(struct LiveFmtMux *m, AVPacket *pkt,
-                          AVRational src_tb, int out_st, int to_asc)
+/* Clone the source packet, apply one common-epoch shift and one rescale to the
+ * muxer stream time base, run the existing codec bitstream conversion, then
+ * hand ownership to the standard interleaver. No per-track DTS repair. */
+static int live_mux_write_packet(struct LiveFmtMux *m, const AVPacket *pkt,
+                                 AVRational src_tb, int out_st)
 {
     AVFormatContext *oc;
     AVStream *st;
     AVPacket *out;
-    int ret;
+    int ret, to_asc;
 
     if (!m || !m->oc)
         return 0;
     oc = m->oc;
-    if (out_st < 0 || out_st >= oc->nb_streams)
+    if (out_st < 0 || out_st >= (int)oc->nb_streams)
         return 0;
     st = oc->streams[out_st];
     out = av_packet_clone(pkt);
     if (!out)
         return AVERROR(ENOMEM);
     out->stream_index = out_st;
-    if (m->have_off && m->ts_off != AV_NOPTS_VALUE) {
-        int64_t off = av_rescale_q(m->ts_off, AV_TIME_BASE_Q, src_tb);
-        if (out->pts != AV_NOPTS_VALUE)
-            out->pts -= off;
-        if (out->dts != AV_NOPTS_VALUE)
-            out->dts -= off;
+
+    ret = http_mux_packet_prepare(out, src_tb, st->time_base, m->epoch_us);
+    if (ret < 0) {
+        av_packet_free(&out);
+        return ret;
     }
-    av_packet_rescale_ts(out, src_tb, st->time_base);
-    if (out_st == m->v_out && m->v_priming > 0) {
-        /* AAC encoder delay is not in fMP4; FLV players compensate, MP4 does
-         * not — video looks 40–80ms early. Shift video to match. */
-        if (out->pts != AV_NOPTS_VALUE)
-            out->pts += m->v_priming;
-        if (out->dts != AV_NOPTS_VALUE)
-            out->dts += m->v_priming;
-    }
-    live_sanitize_ts(m, out, st, out_st);
-    /* After sanitize: TS/ADTS players skip AAC priming so audio leads
-     * video by ~a_pad (40–80ms). Delay audio PTS; FLV/MP4 unchanged. */
-    if (out_st == m->a_out && m->a_priming > 0) {
-        if (out->pts != AV_NOPTS_VALUE)
-            out->pts += m->a_priming;
-        if (out->dts != AV_NOPTS_VALUE)
-            out->dts += m->a_priming;
-    }
+
     if (st->codecpar && st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO &&
-        out->side_data && out->side_data_elems)
-        av_packet_side_data_remove(out->side_data, &out->side_data_elems,
-                                   AV_PKT_DATA_NEW_EXTRADATA);
+        out->side_data && out->side_data_elems) {
+        int i;
+        for (i = 0; i < out->side_data_elems; i++) {
+            if (out->side_data[i].type != AV_PKT_DATA_NEW_EXTRADATA)
+                continue;
+            av_free(out->side_data[i].data);
+            out->side_data[i] = out->side_data[out->side_data_elems - 1];
+            out->side_data_elems--;
+            if (!out->side_data_elems)
+                av_freep(&out->side_data);
+            i--;
+        }
+    }
+
+    to_asc = out_st == m->a_out ? m->to_asc : 0;
+
     if (m->vbsf && out_st == m->v_out) {
         AVPacket *flt = av_packet_alloc();
         if (!flt) {
@@ -1735,7 +1619,7 @@ static int live_write_pkt(struct LiveFmtMux *m, AVPacket *pkt,
         out = flt;
         out->stream_index = out_st;
     } else if (m->to_avcc && st->codecpar &&
-        st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+               st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
         ret = live_pkt_to_avcc(out, st->codecpar->codec_id);
         if (ret < 0) {
             av_packet_free(&out);
@@ -1750,11 +1634,30 @@ static int live_write_pkt(struct LiveFmtMux *m, AVPacket *pkt,
             return ret;
         }
     }
-    ret = av_write_frame(oc, out);
+
+    /* av_interleaved_write_frame() consumes out's reference and resets the
+     * packet; free only the now-empty struct to avoid a double free. */
+    ret = av_interleaved_write_frame(oc, out);
     av_packet_free(&out);
-    if (ret >= 0 && oc->pb)
-        avio_flush(oc->pb);
     return ret;
+}
+
+/* Recoverable single-format failure: stop publishing this format, drop any
+ * partial unit, and wait for the next video key packet to rebuild. */
+static void live_mux_fail(HttpLivePub *pub, int fi, int err)
+{
+    struct LiveFmtMux *m = &pub->fmux[fi];
+
+    if (m->failed)
+        return;
+    m->failed = 1;
+    http_mux_output_finish(&m->output, 0);
+    /* Retire this generation immediately so live clients drop now instead of
+     * waiting for the next-key rebuild. Guarded by m->failed above: once only. */
+    live_mux_invalidate(pub, fi);
+    ffmpeg_http_log(AV_LOG_WARNING,
+                    "http-live: mux %s write failed (%d), waiting for key\n",
+                    m->name ? m->name : "?", err);
 }
 
 static int live_add_spec(const char *app, const char *stream, int file_index)
@@ -1909,8 +1812,6 @@ int ffmpeg_http_live_init(void)
         pubs[i].vtb = (AVRational){ 0, 1 };
         pubs[i].atb = (AVRational){ 0, 1 };
         pubs[i].vfr = (AVRational){ 0, 1 };
-        pubs[i].a_pad = 0;
-        pubs[i].a_rate = 0;
         pubs[i].t_start = 0;
         pubs[i].last_key_pts = AV_NOPTS_VALUE;
         pubs[i].gop_us = 0;
@@ -1924,7 +1825,10 @@ int ffmpeg_http_live_init(void)
             for (f = 0; f < LIVE_FMT_NB; f++) {
                 atomic_init(&pubs[i].fmt_want[f], 0);
                 atomic_init(&pubs[i].mux_on[f], 0);
-                http_ring_init(&pubs[i].fmux[f].ring);
+                atomic_init(&pubs[i].fmux[f].generation, 0);
+                http_ring_init(&pubs[i].fmux[f].ring,
+                               HTTP_RING_DEFAULT_CAPACITY,
+                               HTTP_RING_DEFAULT_MAX_BYTES);
                 for (w = 0; w < HTTP_EV_MAX; w++)
                     atomic_init(&pubs[i].viewers[w][f], 0);
             }
@@ -1974,7 +1878,12 @@ void ffmpeg_http_live_uninit(void)
             {
                 int f;
                 for (f = 0; f < LIVE_FMT_NB; f++) {
-                    live_mux_free(&pubs[i].fmux[f]);
+                    struct LiveFmtMux *m = &pubs[i].fmux[f];
+                    /* Drain the interleaver once on shutdown (never per-packet). */
+                    if (m->oc && atomic_load(&pubs[i].mux_on[f]) && !m->failed)
+                        av_interleaved_write_frame(m->oc, NULL);
+                    live_mux_free(m);
+                    http_ring_destroy(&m->ring);
                     atomic_store(&pubs[i].mux_on[f], 0);
                 }
             }
@@ -2080,9 +1989,11 @@ int ffmpeg_http_live_serve(void *http_conn, const char *fmt,
     HttpLivePub *pub;
     struct LiveFmtMux *m;
     HttpLiveBuf *b = NULL;
+    HttpLiveBuf *hdr = NULL;
+    uint64_t my_gen = 0;
     int fi, wid, ret = 0, wait_ms;
     int64_t t_wait, deadline;
-    unsigned rpos;
+    uint64_t rpos;
     const char *why = "ok";
     int wait_key;
 
@@ -2163,23 +2074,53 @@ int ffmpeg_http_live_serve(void *http_conn, const char *fmt,
         why = "mux-off";
         goto out;
     }
-    ffmpeg_http_log(AV_LOG_INFO, "http-live: [%s] mux header ok\n", peer);
-    if (m->header && ffmpeg_http_conn_write(c, m->header->data, m->header->size) < 0) {
+    /* Bind to the current stable generation and take a private reference to the
+     * shared header under live_mutex (the mux writer, rebuild and free all run
+     * on that lock). Admission refuses a format with a pending retirement
+     * (failed OR want_rebuild): in that window the generation was already bumped
+     * and the header/ring belong to the outgoing epoch, so a new client must not
+     * ref/send the stale header or bind the pre-bumped generation. The HTTP 200
+     * was already sent, so refusal is a plain connection close and the client
+     * reconnects onto the rebuilt generation (safety first). Once referenced, a
+     * concurrent rebuild that unrefs m->header cannot free the bytes out from
+     * under us: this closes the header TOCTOU use-after-free. No network write is
+     * performed while holding the lock; everything below uses only local hdr. */
+    pthread_mutex_lock(&live_mutex);
+    if (!live_mux_admit(atomic_load(&pub->mux_on[fi]), m->failed,
+                        m->want_rebuild)) {
+        why = (m->failed || m->want_rebuild) ? "mux-restart" : "mux-off";
+        pthread_mutex_unlock(&live_mutex);
+        goto out;
+    }
+    my_gen = atomic_load(&m->generation);
+    if (m->header)
+        hdr = http_livebuf_ref(m->header);
+    pthread_mutex_unlock(&live_mutex);
+
+    ffmpeg_http_log(AV_LOG_INFO, "http-live: [%s] mux header ok gen=%" PRIu64 "\n",
+           peer, my_gen);
+    if (hdr && ffmpeg_http_conn_write(c, hdr->data, hdr->size) < 0) {
         why = ffmpeg_http_conn_kicked(c) ? "kicked" : "write-fail";
         goto out;
     }
-    if (m->header)
-        atomic_fetch_add(&pub->bytes_out, (uint64_t)m->header->size);
-    wait_key = 1;
+    if (hdr)
+        atomic_fetch_add(&pub->bytes_out, (uint64_t)hdr->size);
     if (lowdelay) {
+        /* Low delay: begin caught up at the current write position and wait
+         * for the next newly published key/sync unit. */
         rpos = http_ring_wpos(&m->ring);
         wait_key = 1;
     } else {
-        rpos = http_ring_valid_gop(&m->ring);
-        /* TS used to start at oldest when no GOP mark was seen. Audio played
-         * immediately while video waited for the next IDR (~1s / half GOP). */
-        if (rpos == http_ring_wpos(&m->ring))
+        /* Default: begin at the newest complete sync unit. If none exists yet,
+         * begin caught up and wait for the next key. */
+        uint64_t sync = http_ring_latest_sync(&m->ring);
+        if (sync == HTTP_RING_NO_SYNC) {
+            rpos = http_ring_wpos(&m->ring);
             wait_key = 1;
+        } else {
+            rpos = sync;
+            wait_key = 0;
+        }
     }
     ffmpeg_http_log(AV_LOG_INFO,
            "http-live: [%s] streaming /%s/%s %s%s setup=%dms wait=%dms\n",
@@ -2187,29 +2128,49 @@ int ffmpeg_http_live_serve(void *http_conn, const char *fmt,
            (int)((av_gettime_relative() - accept_us) / 1000), wait_ms);
 
     while (atomic_load(&live_running)) {
+        int caught_up = 0;
+
         if (ffmpeg_http_conn_kicked(c)) {
             why = "kicked";
             goto out;
         }
-        if (http_ring_stale(&m->ring, rpos)) {
-            unsigned jump = http_ring_valid_gop(&m->ring);
-            ffmpeg_http_log(AV_LOG_WARNING,
-                   "http-live: [%s] client lagged, skip GOP rpos=%u -> %u w=%u\n",
-                   peer, rpos, jump, http_ring_wpos(&m->ring));
-            rpos = jump;
-            wait_key = 1;
-            why = "lagged";
+        /* The bound generation was retired (fail / late-audio / rebuild):
+         * disconnect now and never read the rebuilt ring. Checked once per
+         * round (covers the post-wake case) and again before every ring read
+         * below (covers a rebuild mid-drain). Distinct from cache-stale lag. */
+        if (atomic_load(&m->generation) != my_gen) {
+            why = "mux-restart";
+            goto out;
         }
-        while (!http_ring_stale(&m->ring, rpos) && rpos < http_ring_wpos(&m->ring)) {
-            b = http_ring_get(&m->ring, rpos);
-            if (!b) {
-                if (http_ring_stale(&m->ring, rpos))
-            break;
-                rpos++;
-                continue;
+        while (!caught_up) {
+            int gret;
+
+            if (atomic_load(&m->generation) != my_gen) {
+                why = "mux-restart";
+                goto out;
             }
+            gret = http_ring_get(&m->ring, rpos, &b);
+
+            if (gret == AVERROR(EAGAIN)) {
+                /* No unit at rpos yet: caught up, wait for the next publish. */
+                caught_up = 1;
+                break;
+            }
+            if (gret == AVERROR(ESTALE)) {
+                /* This exact sequence was evicted: disconnect the lagging
+                 * client. Never fast forward to a newer (future) GOP. */
+                why = "cache-stale";
+                ret = AVERROR(ESTALE);
+                goto out;
+            }
+            if (gret < 0) {
+                why = "ring-error";
+                ret = gret;
+                goto out;
+            }
+            /* gret == 0: b holds the unit at rpos. */
             rpos++;
-            if (wait_key && !b->is_key) {
+            if (wait_key && (!b || !b->is_key)) {
                 http_livebuf_unref(&b);
                 continue;
             }
@@ -2232,6 +2193,8 @@ int ffmpeg_http_live_serve(void *http_conn, const char *fmt,
     if (!strcmp(why, "ok") && !atomic_load(&live_running))
         why = "shutdown";
 out:
+    /* Release the private header reference taken under live_mutex, if any. */
+    http_livebuf_unref(&hdr);
     atomic_fetch_sub(&pub->viewers[wid][fi], 1);
     atomic_fetch_sub(&pub->fmt_want[fi], 1);
     ffmpeg_http_log(AV_LOG_INFO,

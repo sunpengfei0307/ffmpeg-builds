@@ -880,6 +880,15 @@ void fg_free(FilterGraph **pfg);
 void fg_send_command(FilterGraph *fg, double time, const char *target,
                      const char *command, const char *arg, int all_filters);
 
+/**
+ * Queue a filter command and wait until the filter thread runs it.
+ * On success, res receives the same text avfilter_graph_send_command writes.
+ * timeout_ms <= 0 uses 5000. Returns ETIMEDOUT if the filter thread does not finish.
+ */
+int fg_send_command_wait(FilterGraph *fg, double time, const char *target,
+                         const char *command, const char *arg, int all_filters,
+                         char *res, int res_len, int timeout_ms);
+
 int ffmpeg_parse_options(int argc, char **argv, Scheduler *sch);
 
 void enc_stats_write(OutputStream *ost, EncStats *es,
