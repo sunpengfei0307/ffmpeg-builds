@@ -283,6 +283,7 @@ OBJS-$(CONFIG_DEINTERLACE_QSV_FILTER)        += vf_vpp_qsv.o
 OBJS-$(CONFIG_DEINTERLACE_VAAPI_FILTER)      += vf_deinterlace_vaapi.o vaapi_vpp.o
 OBJS-$(CONFIG_DEJUDDER_FILTER)               += vf_dejudder.o
 OBJS-$(CONFIG_DELOGO_FILTER)                 += vf_delogo.o
+OBJS-$(CONFIG_DELOGO_CUDA_FILTER)            += vf_delogo_cuda.o vf_delogo_cuda.ptx.o cuda/load_helper.o
 OBJS-$(CONFIG_DENOISE_VAAPI_FILTER)          += vf_misc_vaapi.o vaapi_vpp.o
 OBJS-$(CONFIG_DESHAKE_OPENCL_FILTER)        += vf_deshake_opencl.o opencl.o \
                                                 opencl/deshake.o transform.o
@@ -303,6 +304,9 @@ OBJS-$(CONFIG_DRAWBOX_FILTER)                += vf_drawbox.o
 OBJS-$(CONFIG_DRAWGRAPH_FILTER)              += f_drawgraph.o
 OBJS-$(CONFIG_DRAWGRID_FILTER)               += vf_drawbox.o
 OBJS-$(CONFIG_DRAWTEXT_FILTER)               += vf_drawtext.o textutils.o
+OBJS-$(CONFIG_DRAW_TEXT_CUDA_FILTER)         += vf_draw_text_cuda.o vf_draw_text_cuda.ptx.o vf_draw_text_cuda_msyh.o cuda/load_helper.o
+libavfilter/vf_draw_text_cuda_msyh.o: $(SRC_PATH)/libavfilter/draw_text_msyh.ttc
+
 OBJS-$(CONFIG_DRAWVG_FILTER)                 += vf_drawvg.o textutils.o
 OBJS-$(CONFIG_EDGEDETECT_FILTER)             += vf_edgedetect.o edge_common.o
 OBJS-$(CONFIG_ELBG_FILTER)                   += vf_elbg.o
